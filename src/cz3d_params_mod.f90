@@ -1,0 +1,730 @@
+module cz3d_params_mod
+  ! Run-time parameters of the 3D convection-zone run (namelist &cz3d in the
+  ! parameter file, read by the root and shared through ARBOR's config).
+  use arbor
+  implicit none
+  public
+
+  ! --- input / output ---
+  ! inputs in data/ (`make data` generates the EOS table and the static
+  ! background there; the grid and the opacity table are kept in the repository)
+  character(len=256) :: grid_file    = 'data/grid_full.dat'   ! merged 1D grid (faces of cells 1..n_r)
+  ! 1D state + background. Default: the static CZ envelope (hydrostatic, from
+  ! tools/static_bg.x + tools/build_static_init.py; state = background, so
+  ! the run starts from ds1_random). Until 2026-10-14 the runs used CZTR's
+  ! step-1 state '../CZTR/output/step1_cz_alone_dtcz/final_init.dat' (the same
+  ! background below ~1.8 Mm depth; above it, CZ_1D's diffusion-balanced
+  ! profile, up to 4% off hydrostatic at ~300 km)
+  character(len=256) :: init_file    = 'data/static_init.dat'
+  character(len=256) :: table_file   = 'data/eos_table.bin'                  ! eos_hhe runtime table (make data)
+  character(len=256) :: opacity_file = 'data/opacity_merged_x70_z02.dat'
+  character(len=256) :: out_dir      = 'output/run'
+
+  ! --- grid: n_r radial cells (cells 1..n_r of the 1D grid; 0 = the join
+  !     cell k of init_file), Yin-Yang n_theta x n_phi per patch, blocks of
+  !     nb_r x nb_theta x nb_phi; nb_r = 0: the whole radial column in one
+  !     block (nb_r = n_r), else nb_r must divide n_r ---
+  integer :: n_r_cells = 0
+  real(dp) :: r_top_rsun = 0.0_dp       ! > 0: the top cell is the last with its centre below r_top_rsun x R_sun (overrides n_r_cells)
+  integer :: n_theta = 54, n_phi = 150
+  integer :: nb_r = 0, nb_theta = 9, nb_phi = 25
+  ! multirate (ARBOR's rate levels, ratio 2, from each block's stable dt;
+  ! time accurate, global steps): mr_levels > 1 levels at most (needs
+  ! radial blocks to gain); mr_extrapolate: ghosts from faster neighbours
+  ! extrapolated in time (2nd order) instead of frozen at the substep start
+  integer :: mr_levels = 0
+  logical :: mr_extrapolate = .false.
+  ! re-levelling: the levels from the blocks' current stable dt again
+  ! (otherwise fixed at the setup, and a multirate restart keeps its own):
+  ! mr_relevel at a restart, and every mr_relevel_dt [s] of model time during
+  ! the run (at the end of a level-1 step; 0 = never). Blocks may move between
+  ! ranks (each level is balanced on its own)
+  logical :: mr_relevel = .false.
+  real(dp) :: mr_relevel_dt = 0.0_dp
+  ! one level per radial shell of blocks (the shell's fastest block): the
+  ! near-surface layer on a single step (per-block levels put neighbouring top
+  ! columns on different steps; the near-surface state depends on dt: mhd4)
+  logical :: mr_by_shell = .true.
+  ! horizontal refinement: after the start or restart, every block is
+  ! refined refine_h levels in theta and phi (ARBOR's conservative
+  ! interpolation), 2^refine_h times finer angles
+  integer :: refine_h = 0
+  ! a refined patch: blocks with a cell centre within patch_radius_deg of
+  ! (patch_lat_deg, patch_lon_deg) (the global frame, the Yin patch's centre at
+  ! 0, 0) refined to patch_level (> refine_h); the neighbours follow (2:1)
+  integer :: patch_level = 0
+  real(dp) :: patch_lat_deg = 0.0_dp, patch_lon_deg = 0.0_dp, patch_radius_deg = 5.0_dp
+  ! debugging probe: every step, the top probe_cells radial cells of every
+  ! column within probe_radius_deg (> 0) of (probe_lat_deg, probe_lon_deg) to
+  ! out_dir/probe_rNNNN.dat
+  real(dp) :: probe_lat_deg = 0.0_dp, probe_lon_deg = 0.0_dp, probe_radius_deg = 0.0_dp
+  ! box output (box_radius_deg > 0): every box_every steps, every cell within
+  ! box_radius_deg of (box_lat_deg, box_lon_deg) and with height z in
+  ! [box_z_km(1), box_z_km(2)] above the photosphere, one file per rank
+  ! (out_dir/box_rNNNN.dat): step t cell z lat lon patch rho T vx vy vz Bx By Bz
+  ! (global Cartesian, as the plot files) beta Mach Q_heat Q_loss
+  real(dp) :: box_lat_deg = 0.0_dp, box_lon_deg = 0.0_dp, box_radius_deg = 0.0_dp, box_z_km(2) = [-2000.0_dp, 20000.0_dp]
+  integer :: box_every = 100
+  integer :: probe_cells = 4
+  integer :: yy_margin = -1               ! Yin-Yang margin cells per side (< 0: ARBOR's default, ng + 1)
+
+  ! --- time stepping ---
+  real(dp) :: cfl = 0.5_dp
+  real(dp) :: t_end = 3600.0_dp
+  real(dp) :: dt_max = 20.0_dp
+  integer  :: n_step_max = huge(1)
+  integer  :: n_log = 100                 ! log line every n_log steps
+  real(dp) :: dt_prof = 600.0_dp          ! horizontally averaged profile every dt_prof s (0 = none)
+  ! plot_at_end: one Tecplot file at the end of the run as well (e.g. a zero-step run from a restart)
+  logical  :: plot_at_end = .false.
+  real(dp) :: plot_dt = 0.0_dp            ! Tecplot file of the state every plot_dt s (0 = none)
+  ! restart files out_dir/restart_NNNNNNNN.rst every restart_dt s (0 = none);
+  ! restart_from: continue from that file (log.txt is appended to). The
+  ! mixing-length flux memory is not stored: it restarts at its targets.
+  real(dp) :: restart_dt = 0.0_dp
+  ! energy budget per radial shell (budget_shells.dat, budget_log.txt in
+  ! out_dir) every dt_budget s (0 = off); see cz3d_app_mod
+  real(dp) :: dt_budget = 0.0_dp
+  character(len=256) :: restart_from = ''
+  ! local time stepping for relaxation (not time accurate; 0 = off): each
+  ! radial shell advances min(its own stable dt, dt1) per step (at least the
+  ! global dt), so the deep layers run ahead of the top. t is then the top's
+  ! clock only; the log and the profiles carry each shell's own clock.
+  ! Read at every start, so it can be changed at a restart.
+  real(dp) :: dt1 = 0.0_dp
+  ! > 0: dt1 falls linearly to 0 over this many steps from the run's start
+  ! (or restart), turning the local stepping off smoothly (alpha -> 1 from the
+  ! top down as dt1 drops below each shell's own step)
+  integer  :: dt1_ramp_steps = 0
+  integer  :: dt1_hold_steps = 0          ! the ramp starts after this many steps (dt1 held until then)
+  integer  :: prof_every = 0              ! > 0: a profile every prof_every steps (instead of dt_prof)
+  ! > 0: accept a restart file written on another machine (e.g. 1e-10), whose
+  ! grid (map ends, face positions) differs in the last bits; this run uses its
+  ! own grid (bit differences: fine for plots and analysis; a continued run is
+  ! not bitwise the same as one on the original machine). 0: exact match
+  real(dp) :: restart_domain_tol = 0.0_dp
+  logical :: restart_new_output = .false.  ! after a restart: a new profile series (from 0, the first now)
+  ! batch jobs: stop cleanly, with a restart file, once the elapsed wall time
+  ! (from the program's start) plus wall_time_margin reaches wall_time_max
+  ! [s] (0 = no limit); checked every wall_check_steps steps. The margin must
+  ! cover one check interval plus writing the restart. out_dir/run_status.txt
+  ! then says 'stopped_wall' (continue from the restart it names) or 'finished'.
+  real(dp) :: wall_time_max = 0.0_dp
+  real(dp) :: wall_time_margin = 1800.0_dp
+  integer  :: wall_check_steps = 20
+
+  ! --- physics ---
+  logical  :: use_radiation  = .true.     ! grey Eddington radiation, radial (per column)
+  logical  :: use_convection = .true.     ! mixing-length flux, radial (per column)
+  real(dp) :: grey_top_km = 0.0_dp        ! implicit grey radiation only in the top grey_top_km (0: the whole column); explicit diffusion below
+  logical  :: use_hyperbolic = .true.     ! hyperbolic relaxation of the convective flux
+  logical  :: qconv_face = .true.         ! the relaxing flux in ARBOR's face state (in restart files, moves with
+                                          ! blocks); .false.: a per-rank array, reset at restarts (older restart files)
+  real(dp) :: alpha_mlt = 1.314263_dp
+  real(dp) :: L_bottom_Lsun = 1.0_dp      ! luminosity through the bottom face
+  real(dp) :: grey_tau_above = 0.01_dp    ! optical depth above the top cell (Eddington top condition)
+  ! grey_atm_blocks (use_atmosphere, si_radial): the grey radiation also in the
+  ! first grey_atm_blocks radial blocks above the join, each column part
+  ! solved after the one below with its outgoing flux as the bottom flux
+  ! (the atmosphere is grey-thin; see grey_atm_column), heating the low
+  ! chromosphere (else only the thin losses act there and T_floor holds it).
+  ! 0: the grey radiation ends at the join (as before)
+  integer :: grey_atm_blocks = 0
+  ! overlap_fills: useful work while the ghost messages travel (the RK
+  ! stages: the interior equation of state; the atmosphere: the losses and
+  ! heating), off with multirate; .false.: plain fills (the same results)
+  logical :: overlap_fills = .true.
+  ! va_cap_horizontal (with va_dt_target > 0 and si_radial): the Alfven-speed
+  ! cap from the horizontal cell sizes only where the radial waves are
+  ! semi-implicit (the si_radial range less its two end cells; as MAS, whose
+  ! semi-implicit term carries the fast speed): cap = cfl dx_h/va_dt_target -
+  ! (c + |v|), not cfl min(dr, dx_h)/va_dt_target - ... (with the 30-70 km
+  ! radial cells that falls to its floor va_floor_cs c_s everywhere above the
+  ! join). The GLM speed keeps the old cap (psi propagates explicitly, also
+  ! radially). Default .false.: the old cap
+  logical :: va_cap_horizontal = .false.
+  ! top energy condition: 'eddington' (radiation escapes through the top
+  ! face, CZTR step 1) or 'cooling' (no radiative flux through the top face;
+  ! a cooling layer removes L_bottom, its flux F(r) = F_top exp(-(r_top - r)/w)
+  ! with w = cool_width_km, as convection.F90; for a top deep in the CZ)
+  character(len=16) :: top_energy = 'eddington'
+  real(dp) :: cool_width_km = 1000.0_dp
+  real(dp) :: cool_width_hp = 0.0_dp      ! > 0: width = cool_width_hp x H_p of the top cell (overrides cool_width_km)
+  ! MLT as a subgrid model: f = 1/(1 + (R/mlt_R0)^mlt_p), R = H_p/(r dtheta)
+  ! the number of pressure scale heights per horizontal cell; off: f = 1
+  logical  :: mlt_switch = .false.
+  real(dp) :: mlt_R0 = 4.0_dp, mlt_p = 4.0_dp
+
+  ! --- well balanced gravity: g = -(dp0/dr)/rho0 with the momentum
+  !     equation's radial stencil in cells 1..n_r, so the background force
+  !     (dp0/dr + rho0 g), which the momentum equation leaves out, is exactly
+  !     0 (off: g of the state file, as CZTR) ---
+  logical :: g_from_background = .false.
+
+  ! --- reduced sound speed (RSST, after Hotta et al.): at most c_target
+  !     [cm/s] everywhere, xi = max(1, c_s0/c_target), the continuity
+  !     equation divided by xi^2 (0 = off; as CZTR's c_target) ---
+  real(dp) :: c_target = 0.0_dp
+  ! depth profile of the reduced sound speed: c_red = min(c_s0, c_target
+  ! (c_s0/c_s0,top)^rsst_q), xi = c_s0/c_red; 0: c_red = c_target everywhere
+  ! (Hotta et al. 2014), 1: xi uniform (Hotta et al. 2012)
+  real(dp) :: rsst_q = 0.0_dp
+  ! the form of the RSST: 'hotta2012' (continuity divided by xi^2; energy not
+  ! conserved, Hotta et al. 2014 App. B) or 'hotta2015' (Hotta et al. 2015
+  ! App. A: rho1 is the scaled perturbation xi^2 rho1 with the ordinary
+  ! continuity equation, the EOS and the buoyancy see rho1/xi^2; conserves
+  ! rho T s1 + rho v^2/2 to linear order)
+  character(len=16) :: rsst_form = 'hotta2012'
+  ! > 0: anchor the reduced sound speed at this depth below the photosphere
+  ! instead of c_target: c_ref = c_s0 there, c_red = min(c_s0, c_ref
+  ! (c_s0/c_ref)^rsst_q), so no reduction above that depth (xi = 1) and xi =
+  ! (c_s0/c_ref)^(1 - rsst_q) below (c_target is then not used)
+  real(dp) :: rsst_depth_km = 0.0_dp
+  ! diagnostic: radial cell indices whose every cell is written at the end of
+  ! the run (out_dir/shell_dump_rNNNN.dat per rank; 0 = unused)
+  integer :: dump_shells(8) = 0
+
+  ! --- magnetic field (ideal MHD, after solar_model): B = (B_r, B_theta,
+  !     B_phi) [G] and the GLM cleaning scalar psi as state variables 6-9;
+  !     dB/dt = curl(v x B) - grad psi, the Lorentz force (curl B) x B/(4 pi
+  !     rho) in the momentum equation, dpsi/dt = -c_h^2 div B with c_h = c_red
+  !     + v_A, then psi damped by exp(-dt alpha_glm c_h/dx_min); the Alfven
+  !     speed enters the time step and the diffusion's speed. B and psi are
+  !     diffused like the velocity (without the density weight); with
+  !     diffusion_heating the dissipated magnetic energy returns as heat ---
+  ! --- rotation: the frame rotates with angular velocity omega_rot [rad/s]
+  !     about the global z axis (Yin's z); the Coriolis acceleration -2
+  !     Omega x v in the momentum equation (no centrifugal term: Omega^2 r/g
+  !     ~ 2e-5). Solar: ~2.6e-6 (414 nHz); 0 = off ---
+  real(dp) :: omega_rot = 0.0_dp
+  ! how: 'split' (exact rotation of v about the axis by -2 Omega dt/2 before
+  ! and after each step, Strang; no stability limit, |v| kept exactly) or
+  ! 'rk' (the term in the RK stages; RK4-like: unstable for 2 Omega dt > ~2.8,
+  ! damping/phase errors ~(2 Omega dt)^5-6 per step)
+  character(len=8) :: coriolis = 'split'
+  ! global angular-momentum correction: the scheme does not conserve the
+  ! flow's L_z about the global axis; every lz_correct_steps steps and/or
+  ! lz_correct_dt seconds (0 = off) the part of L_z's change not due to the
+  ! Coriolis torque is removed by a rigid rotation delta_Omega x r (L_z then
+  ! follows its value at the run's start plus the Coriolis impulse)
+  integer  :: lz_correct_steps = 0
+  real(dp) :: lz_correct_dt = 0.0_dp
+
+  logical  :: use_B = .false.
+  real(dp) :: alpha_glm = 0.5_dp
+  ! the GLM cleaning speed c_h: 'fast' (c_s0/xi + v_A, as solar_model) or
+  ! 'cfl' (the largest the cell's step allows: glm_cfl_frac cfl / [(1/dr +
+  ! 1/(r dtheta) + 1/(r sin theta dphi)) dt_cell], at least c_s0/xi + v_A;
+  ! much faster than 'fast' wherever the cell's step is below its own limit,
+  ! e.g. deep cells under global stepping)
+  character(len=8) :: glm_ch = 'fast'
+  ! factor on the diffusion of B and psi only (1: as the velocity; 0: off,
+  ! for tests)
+  real(dp) :: b_diff_factor = 1.0_dp
+  ! the slope-limited diffusion of B and psi (MURaM's coronal settings, Rempel
+  ! 2017 sec. 2.6: h = 5 for the field, MC slopes): b_diffusion_h the h of
+  ! the field's fluxes (< 0: diffusion_h), h > 1 switching the diffusion off
+  ! where the field is smooth; b_diff_limiter the slopes of its
+  ! reconstruction, 'minmod' (as the other variables) or 'mc' (monotonized
+  ! central, Rempel 2014 eq. 8)
+  real(dp) :: b_diffusion_h = -1.0_dp
+  character(len=8) :: b_diff_limiter = 'minmod'
+  ! b_diff_form: 'component' (each component of B diffused on its own, as the
+  ! velocity) or 'resistive' (the diffusion as -curl(eta J): through a face
+  ! normal to d the flux of B_m (m /= d) is -eta (d_d B_m - d_m B_d) with the
+  ! spherical metric factors, none of B_d; the normal derivative a compact jump
+  ! across the face, the tangential one the mean of the two cells' central
+  ! differences). One scalar eta field for every current component, so each
+  ! pair of terms of a current gets the same eta (dissipative):
+  !   eta = b_diff_factor Phi (|v| + c)/2 dh   per cell, the face eta the mean
+  ! of its two cells; dh the cell's horizontal width (the smaller of r dtheta,
+  ! r sin(theta) dphi), c = c_s + v_A (derived), Phi the largest limiter weight
+  ! (b_diffusion_h, b_diff_limiter) of the three components' jumps at the
+  ! cell's six faces. The radial normal term d_r(r B_h) on the radial faces
+  ! (eta dh/dr^2 ~ 1e3 times the explicit limit at the TR) is implicit: one
+  ! tridiagonal solve per column and component after the explicit fluxes
+  ! (the end faces' ghost values explicit); the mixed terms stay explicit
+  ! (stable for any dt where the horizontal part is: the split keeps a
+  ! curl-free mode neutral). With diffusion_heating the field energy the solve
+  ! removes in the CZ goes into s1. A potential field carries no current (to
+  ! the stencils' truncation error); psi keeps the component form. Needs
+  ! si_radial (whole columns per rank) with the full column implicit
+  ! (si_z_km default) and the edge ghosts (filled before the diffusion).
+  ! (2026-11-20: an earlier version with eta = Phi C ds per face, C dr on
+  ! radial faces and C r dtheta on horizontal ones, was anti-dissipative:
+  ! the join's field grew to 5 kG in the diffusion-only test)
+  ! Test (2026-11-20, mhd5 + DPF at 1.875 deg, diffusion only, h = 5 MC,
+  ! 479 s): stable (max |B| 3.1 -> 2.7 kG, div B 4.9e-3 -> 1.4e-2) but it
+  ! changes the corona more than the component form (rms change 64/99/73/52%
+  ! at 1.1/3/10/20 Mm vs 32/76/67/53%, and still drifting 5-10% per 50 s):
+  ! Phi ~ 1 at the field's grid-scale concentrations, and the radial term
+  ! then carries eta ~ c dh too. About 2x the component form's cost in that
+  ! test (the eta pass, its ghost fill, the column solves)
+  character(len=12) :: b_diff_form = 'component'
+  ! b_eta_dr > 0 (with b_diff_form = 'resistive'; CZTR_2D's resistivity): the
+  ! cells' eta = b_eta_dr (|v| + c_s) dr/2 instead (dr the cell's radial size,
+  ! |v| its speed, c_s the RSST-reduced sound speed without v_A; |v| alone
+  ! with b_eta_cs = F), no limiter weight, not scaled by b_diff_factor (which
+  ! still scales psi's diffusion). CZTR_2D (notes/plan.md 2026-11-20): |v| dr/2
+  ! the best of its tests (stable, no odd-even ringing, TR horizontal flows
+  ! halved vs Rempel; 1-cell B peaks where the flow is slow and converging);
+  ! with c_s it pumped the ~145 s column mode
+  real(dp) :: b_eta_dr = 0.0_dp
+  logical  :: b_eta_cs = .false.
+  ! b_eta_radial (b_diff_form = 'resistive'): the radial normal term of B_theta,
+  ! B_phi (d_r(r B_h)) 'implicit' (per column, b_radial_implicit) or
+  ! 'explicit' (in the radial faces' fluxes like the other terms; no column
+  ! solve, its field energy through the diffusion's energy flux). Explicit:
+  ! each cell's eta capped at the explicit limit with a safety factor 0.8,
+  !   eta <= 0.8 / [2 tsc dt (1/dr^2 + 1/(r dtheta)^2 + 1/(r sin theta dphi)^2)],
+  ! dr the smaller centre spacing to its radial neighbours (with
+  ! eta = |v| dr/2 the cap acts where |v| tsc dt/dr > ~0.8: fast flows); the
+  ! fraction of capped cells is printed at the end of the run
+  character(len=8) :: b_eta_radial = 'implicit'
+  logical :: b_eta_explicit = .false.
+  ! test_b_diff_only (a test): each step applies only the diffusion's fluxes
+  ! of B and psi (the gas, the other terms and operators frozen): how the
+  ! diffusion alone changes the initial field
+  logical :: test_b_diff_only = .false.
+  ! test_freeze_b (a test): B and psi held at their values at the run's
+  ! first step (no induction, field diffusion or GLM; the Lorentz force acts):
+  ! what the initial field's force alone drives
+  logical :: test_freeze_b = .false.
+  ! b_smooth_cells > 0: before the PFSS/DPF seed (fresh start or import), the
+  ! CZ's field smoothed horizontally on every shell (the same angular
+  ! diffusion at all depths: div B nearly kept) to a diffusion length of
+  ! b_smooth_cells cells (see cz_smooth_b). For the coarsened mhd5 field
+  ! (2x2-cell spots under the DPF; the Yin-Yang corner force). Not by the
+  ! resistive operator: with dh/dr ~ 700 its mixed term turns a horizontal
+  ! smoothing step into a large B_r change at the join (tested 2026-11-20); and
+  ! not tapered with depth (d_r of the smoothing weight makes div B ~ |B|/dh)
+  real(dp) :: b_smooth_cells = 0.0_dp
+
+  ! --- synthetic EUV images (use_atmosphere), made in the run (see euv_write):
+  ! euv_dt > 0: every euv_dt s of model time (the first at the run's first
+  ! step); euv_at_end: also at the end (e.g. a zero-step run from a restart).
+  ! For each view v = 1..euv_n_view an observer at infinity in the direction
+  ! (euv_lon_deg(v), euv_lat_deg(v)) (the global frame's longitude and
+  ! latitude), solar north up, x along increasing longitude at the
+  ! sub-observer point. The image is euv_npix^2 pixels over
+  ! [-euv_fov_rsun, euv_fov_rsun]^2 (in R_sun, from the Sun's centre). Each
+  ! atmosphere cell adds n_e n_H K_c(T) dV / A_pixel for each channel c of
+  ! euv_table (K: DN cm^5 s^-1 per AIA pixel, per n_e n_H; tools/aia_response.py),
+  ! split into sub-points about half a pixel apart; points hidden behind the
+  ! sphere at the join are left out. Image values: DN s^-1 per AIA pixel.
+  ! euv_trac (with trac_Tc > 0): the emission times the TR broadening factor
+  ! f(T) (as the losses): the TR stretched by 1/f holds 1/f of its emission
+  ! measure, so f restores the unbroadened emission (Lionello et al. 2009).
+  ! Output: out_dir/euv_NNNNNNNN.bin (tools/euv_plot.py reads it)
+  real(dp) :: euv_dt = 0.0_dp, euv_fov_rsun = 1.3_dp
+  logical :: euv_at_end = .false., euv_trac = .true.
+  integer, parameter :: euv_max_view = 8
+  integer :: euv_n_view = 1, euv_npix = 512
+  real(dp) :: euv_lon_deg(euv_max_view) = 0.0_dp, euv_lat_deg(euv_max_view) = 0.0_dp
+  character(len=256) :: euv_table = 'data/aia_response.dat'
+  ! --- synthetic continuum images (phot_n_lambda > 0; see phot_write): the
+  ! emergent LTE continuum intensity at phot_lambda_A(1:phot_n_lambda) [A]
+  ! (e.g. 4500 the AIA continuum channel, 6173 HMI), written with the EUV
+  ! images (euv_dt/euv_at_end, the same views, pixels and field of view; with
+  ! use_atmosphere off only these). Each surface column is a plane-parallel
+  ! atmosphere seen at its mu: the formal solution along the slanted ray
+  ! through the cells with phot_z_km(1) < z < phot_z_km(2), S = B_lambda(T),
+  ! opacity H- bound-free and free-free (John 1988) + hydrogen bound-free and
+  ! free-free (hydrogenic, Gaunt 1), H ionization by Saha with the EOS n_e;
+  ! no scattering. Image values: the pixel-mean intensity
+  ! [erg s^-1 cm^-2 sr^-1 A^-1]. Output: out_dir/phot_NNNNNNNN.bin (the EUV
+  ! format with the wavelengths as the channels).
+  integer, parameter :: phot_max_lambda = 4
+  integer :: phot_n_lambda = 0
+  real(dp) :: phot_lambda_A(phot_max_lambda) = [4500.0_dp, 6173.0_dp, 5000.0_dp, 1.6e4_dp]
+  real(dp) :: phot_z_km(2) = [-3000.0_dp, 5000.0_dp]
+  ! phot_band_file (e.g. 'data/aia_uv_bands.dat', tools/aia_uv_response.py):
+  ! the channels are the file's AIA bands (1600, 1700, 4500), each the
+  ! continuum intensity summed over its wavelengths with the response
+  ! weights: DN s^-1 per AIA pixel (out_dir/photb_NNNNNNNN.bin); with it
+  ! phot_lambda_A is not used and phot_n_lambda = 0 is allowed. Below 2600 A
+  ! the metals' bound-free opacity enters (LTE, rough cross sections; see
+  ! kappa_metal). The 1600 band's TR lines (C IV) come from the EUV path
+  ! (euv_table data/aia_response_uv.dat: channels 1600/1700).
+  character(len=256) :: phot_band_file = ''
+  logical :: phot_on = .false.
+  real(dp) :: glm_cfl_frac = 0.8_dp
+  ! walls: 'conductor' (B_r = 0, B_h mirrored) or 'radial' (B_h = 0, B_r
+  ! mirrored: the field vertical at the wall); Hotta et al. 2014: conductor at
+  ! the bottom, vertical at the top
+  character(len=12) :: b_bc_bottom = 'conductor', b_bc_top = 'radial'
+  ! Alfven-speed cap (after Rempel 2009/2017) [cm/s]: the Lorentz force times
+  ! f = 1/sqrt(1 + (v_A/va_max)^4), so the waves' speed sqrt(f) v_A stays
+  ! below ~va_max; that speed (not v_A) enters the time step, the diffusion's
+  ! speed and c_h. Not energy conserving where it acts (W_Lorentz in the log
+  ! is the scaled work: its sum with dE_mag/dt is the cap's energy sink). 0 = off
+  real(dp) :: va_max = 0.0_dp
+  ! the cap from a target time step instead (va_dt_target [s] > 0; then
+  ! va_max is not used): per cell cap = max(cfl dx_min/va_dt_target - (c_s +
+  ! |v|), va_floor_cs c_s S(z), 1 km/s), S the atmosphere switch (0 in the CZ),
+  ! so each cell's Alfven speed is cut where it would limit the step below
+  ! the target, and in the atmosphere never below va_floor_cs times its sound speed
+  real(dp) :: va_dt_target = 0.0_dp, va_floor_cs = 2.0_dp
+  ! initial field added at the start (also to an imported state):
+  ! 'none' or 'toroidal': B_phi = b_seed_G sin(theta) w(r) about the global z
+  ! axis (divergence free), w = 1 below b_seed_r1_rsun, 0 above
+  ! b_seed_r2_rsun, a sin^2 step between (keeps it off a vertical-field top);
+  ! or 'dipole': the l = 1 potential field about the global z axis with a
+  ! source surface at b_seed_rss_rsun (Phi ~ cos(theta) [(r_ss/r)^2 - r/r_ss],
+  ! B_theta = 0 at r_ss), radial above it (B_r(r_ss, theta) (r_ss/r)^2);
+  ! b_seed_G = B_r at the pole at the photosphere (r_top_cz);
+  ! or 'pfss' (use_atmosphere): the field above the join replaced by the
+  ! potential field (source surface b_seed_rss_rsun, radial above it) of the
+  ! B_r of the join cell (the CZ's own field, e.g. imported), after the
+  ! blocks are set up (fresh start, import, or a hydrodynamic restart);
+  ! harmonics to l = pfss_lmax (0: pi/dtheta of the finest cells, 96 at
+  ! 1.875 deg, 384 at 0.47 deg), the quadrature fit refined pfss_iter times on
+  ! its residual; the monopole is dropped. Accuracy (runs/pfss_check.nml,
+  ! dipole): round-off at pi/(2 dtheta), ~1e-3 at pi/dtheta (the Yin-Yang
+  ! midpoint sums alias near the grid scale). The full pi/dtheta is needed for
+  ! a CZ field: mhd5 coarsened to 1.875 deg leaves 73% of rms B_r unfitted at
+  ! l = 48 and 28% at l = 96 (single-cell flux concentrations, no l can fit
+  ! them); that part stays as a B_r jump at the join (the residual on the
+  ! 'pfss: ... pass' lines), for GLM to clean.
+  ! pfss_check (a test): the CZ field is first set to the 'dipole' seed
+  ! (b_seed_G) and the PFSS result compared with it
+  character(len=12) :: b_seed = 'none'
+  real(dp) :: b_seed_G = 100.0_dp, b_seed_r1_rsun = 0.95_dp, b_seed_r2_rsun = 0.98_dp
+  real(dp) :: b_seed_rss_rsun = 2.5_dp
+  integer :: pfss_lmax = 0, pfss_iter = 6
+  ! friction on the velocity above the join (a relaxation of the field and
+  ! the atmosphere towards force balance without violent flows): v_h, and
+  ! v_r's deviation from the init file's profile (the wind), multiplied
+  ! by 1 - w/(v_damp_n + 1) after every step (a damping time of v_damp_n
+  ! steps, per shell's own step with local time stepping), w = 1 for the run's
+  ! first v_damp_steps steps (counted from this run's start), then falling
+  ! linearly to 0 over v_damp_ramp steps; v_damp_n = 0: off
+  real(dp) :: v_damp_n = 0.0_dp
+  integer :: v_damp_steps = 0, v_damp_ramp = 0
+  ! where the friction acts: from v_damp_below_km below the join (0: not in the
+  ! CZ) to v_damp_above_km above it (< 0: the whole atmosphere), the weight
+  ! falling as cos^2 over v_damp_taper_km beyond each end (below only if
+  ! v_damp_below_km > 0, above only if v_damp_above_km >= 0); towards 0 for
+  ! v_h and towards the init file's v_r (the wind; 0 in the CZ)
+  real(dp) :: v_damp_below_km = 0.0_dp, v_damp_above_km = -1.0_dp, v_damp_taper_km = 500.0_dp
+  ! the schedule in model time instead (v_damp_time_s > 0; with multirate the
+  ! step counts differ between levels): full friction for v_damp_time_s after
+  ! the run's start, then falling linearly to 0 over v_damp_ramp_s
+  real(dp) :: v_damp_time_s = 0.0_dp, v_damp_ramp_s = 0.0_dp
+  logical :: pfss_check = .false.
+  ! dpf_check (a test, with b_seed = 'pfss'): B = -grad Phi of the PFSS potential
+  ! with the code's own stencils, its curl against the analytic PFSS field's
+  ! (patch interior / patch edges, by height); the run keeps the analytic field
+  logical :: dpf_check = .false.
+  ! or 'dpf' (use_atmosphere): a discrete potential field above the join. Phi
+  ! solves the compact finite-volume Laplace equation on the grid (BiCGSTAB,
+  ! a radial tridiagonal preconditioner per block column, the PFSS potential
+  ! as the start), with the flux of the join cell's B_r through the join face
+  ! (Neumann) and Phi = 0 at the radial-block face nearest b_seed_rss_rsun;
+  ! B = -grad Phi with the code's own stencils (curl free on the grid inside
+  ! the Yin-Yang patches), radial above that face. The ghost interpolation is
+  ! linear (unlimited) during the solve. Stops at a relative residual dpf_tol
+  ! or after dpf_maxit iterations.
+  ! dpf_operator: 'compact' (the default) or 'wide' (the code's own div and
+  ! grad, 4th-order stencils: div B and curl B exactly zero inside the patches,
+  ! but near-grid-scale photospheric structure decays far too slowly and the
+  ! Yin-Yang ghost interpolation turns it into field at the patch edges;
+  ! 40-step tests from mhd5 at 1.875 deg: v_h up to 486 km/s in the
+  ! outermost patch cells, 66 with 'compact'). Not for use, kept for reference
+  real(dp) :: dpf_tol = 1.0e-8_dp
+  integer :: dpf_maxit = 3000
+  character(len=8) :: dpf_operator = 'compact'
+  ! 'wide': + dpf_eps x the compact operator (the wide one is blind to
+  ! checkerboard modes of Phi, which the preconditioner feeds in and the
+  ! Yin-Yang interpolation turns into field at the patch edges)
+  real(dp) :: dpf_eps = 0.0_dp
+  ! 'wide': the compact equations instead in the cells within dpf_edge_cells
+  ! of a Yin-Yang patch boundary (there the wide operator leaves near-grid-
+  ! scale oscillations of Phi that the ghost interpolation turns into field;
+  ! 40-step tests: v_h > 100 km/s in the outermost patch cells); 0 = none
+  real(dp) :: dpf_edge_cells = 2.5_dp
+  ! magnetofriction after the 'dpf' field (mf_iter > 0): the field above the
+  ! join (below the source surface) relaxed towards zero Lorentz force as the
+  ! code computes it (its curl, its ghost fill: the Yin-Yang edges included),
+  ! the gas frozen: B += curl(d x B), d = mf_alpha h_d^2 (J x B)_d/B^2 per
+  ! direction (h the cell size: dr, r dtheta, r sin(theta) dphi); the CZ
+  ! (and so B_r at the join) fixed
+  ! the slope limiter of the ghost interpolation (Yin-Yang overlap,
+  ! refinement): 'minmod' (ARBOR's default), 'mc', or 'none' (central slopes,
+  ! linear: smoother field at the patch edges, no protection at steep fronts).
+  ! 40-step tests from the compact 'dpf' field: max v_h at the patch edges at
+  ! 5 Mm 53 (minmod), 41 (none), 62 km/s (mc); elsewhere no difference
+  character(len=8) :: ghost_limiter = 'minmod'
+  integer :: mf_iter = 0
+  real(dp) :: mf_alpha = 0.05_dp
+
+  ! --- state transfer between runs with different variable sets (ARBOR's
+  !     restart files hold a fixed number of variables): export_state writes
+  !     every block's interior state at the end of the run
+  !     (out_dir/state_export_rNNNN.bin, and state_export_meta.bin: time,
+  !     step, shell clocks); import_dir continues from such files: the same
+  !     radial grid and horizontal blocks, any radial block size (nb_r) that
+  !     divides the exported one (whole columns -> radial blocks), the tree
+  !     refined to the exported levels (refine_h or patch_level at least as
+  !     high), the common variables copied, the rest (B, psi) zero before the
+  !     seed; the convective flux restarts at its targets ---
+  logical :: export_state = .false.
+  ! out_dir/blocks.dat at the start (after any refinement): the block outlines
+  ! as a Tecplot ASCII file (ARBOR's arbor_plot_blocks: leaf, patch, levels, rank)
+  logical :: plot_blocks = .false.
+  character(len=256) :: import_dir = ''
+
+  ! --- numerical diffusion (Rempel form, as CZTR) ---
+  logical  :: use_diffusion = .true.
+  logical  :: use_minmod    = .true.
+  real(dp) :: diffusion_h   = 1.0_dp
+  ! top layer of full (unlimited, first-order) diffusion: depth < diff_top_km
+  ! full, a cos^2 ramp to the normal limited scheme at 2 diff_top_km (0: off).
+  ! Keeps the grid from overturning at its own scale where granulation is
+  ! unresolved (the MLT carries the flux there).
+  real(dp) :: diff_top_km   = 0.0_dp
+  ! energy-conserving diffusion: the energy the diffusion's mass, momentum
+  ! and entropy fluxes carry gets its own face flux, and each cell's entropy
+  ! is corrected so its energy changes by exactly -dt div F_E (the kinetic
+  ! energy it dissipates returns as heat; see cz3d_app_mod). Off: as CZTR.
+  logical  :: diffusion_heating = .false.
+
+  ! --- walls: 'face' (wall on the boundary face, ghosts mirror cells 1, 2)
+  !     or 'cell' (wall at the boundary cell's centre, v_r = 0 there, ghosts
+  !     mirror the two cells inside); CZTR step 1: bottom face, top cell ---
+  character(len=8) :: wall_bottom = 'face', wall_top = 'cell'
+  ! wall_top = 'outflow' (solar wind, the top far out, ~20 R_sun, where the
+  ! flow is super-Alfvenic): the ghosts above the top cell extrapolated: the
+  ! total density ~ r^-2, v_r copied but not inward (>= 0), v_theta, v_phi
+  ! and the total entropy copied; B_r ~ r^-2, B_theta, B_phi, psi copied;
+  ! the top face's fluxes from these ghosts (not from the wall symmetry)
+
+  ! --- initial perturbation: random s1 of this amplitude [erg/g/K] (0 = none) ---
+  real(dp) :: ds1_random = 0.0_dp
+
+  ! --- atmosphere (CZTR's TR physics, cztr3d_atm_mod; ported from CZTR_2D),
+  !     use_atmosphere: on above the CZ top through the switch
+  !     S(z) = (1 + tanh((z - z_atm)/w_atm))/2: hyperbolic Spitzer conduction
+  !     at the faces in r, theta and phi (HYDRAD's H I term, Rempel
+  !     saturation, relaxed in tau >= 4 dt, signal speed <= f_cfl_cond dx/dt;
+  !     each block keeps its own copy of a face shared with a neighbour),
+  !     Carlsson & Leenaarts + coronal losses (the column mass from p/g, the
+  !     neutral-H column integrated down within the block plus an estimate
+  !     above it), the heating H_peak x e^(1-x), x = z/z_heat, a temperature
+  !     floor where S > 0.5 and a density floor everywhere; dt <= dt_rad_factor
+  !     x the shortest loss time. The background force (dp0/dr + rho0 g) acts
+  !     above the join (the atmosphere's background is not hydrostatic); below
+  !     it is left out (well balanced). Grey radiation and MLT stay in the CZ
+  !     (cells <= k_join, the Eddington top at the photosphere as without the
+  !     atmosphere). Works with radial blocks and multirate. ---
+  logical  :: use_atmosphere = .false.
+  ! heating ~ |B| (Downs et al. 2010, Mok et al. 2005): S H_B |B| exp(-z/lambda_B) x
+  ! 1/(1 + (n_e/n_gate)^4) [erg cm^-3 s^-1, H_B per G] (the gate keeps it out of
+  ! the dense chromosphere; Downs 2016 inject at n_e = 2e11 cm^-3); 0 = off
+  real(dp) :: H_B = 0.0_dp, lambda_B_km = 4.0e4_dp, n_gate = 2.0e11_dp
+  ! H_B_sat_G > 0: the heating takes min(|B|, H_B_sat_G) instead of |B|. Downs'
+  ! H_B was calibrated on magnetograms smoothed to a few Mm; resolved kG
+  ! concentrations (mhd5 at 0.47 deg: up to 2.2 kG in single cells) heated their
+  ! columns beyond active-region levels and both real-field crashes sat at the
+  ! strongest clusters. 50 G caps a column near 1e7 erg/cm2/s; 0 = no cap
+  real(dp) :: H_B_sat_G = 0.0_dp
+  ! conduction along the field (with use_B): the flux -kappa [w (b.grad T) b + (1 - w) grad T],
+  ! w = B^2/(B^2 + b_iso_G^2) (isotropic where there is no field); the tangential
+  ! gradient at a face from its cells' central differences
+  logical  :: cond_along_b = .false.
+  real(dp) :: b_iso_G = 1.0e-3_dp
+  ! the unresolved vertical (network) field in the field-aligned conduction
+  ! (CZTR_2D): rms dB_r(z) = cond_dB0_G (1 - tanh((z - cond_dB_zj_km)/cond_dB_w_km))/2,
+  ! entering <b b> = (B B + dB_r^2 e_r e_r + b_iso^2 I)/(B^2 + dB_r^2 + b_iso^2)
+  ! (a vertical conduction that stays where the resolved field is horizontal,
+  ! below the magnetic junction z_j). 0 = off
+  real(dp) :: cond_dB0_G = 0.0_dp, cond_dB_zj_km = 4000.0_dp, cond_dB_w_km = 1500.0_dp
+  ! more heating, S [H_c exp(-z/lambda_c) + H_ext exp(-z/lambda_ext)]
+  ! [erg cm^-3 s^-1] (Downs et al. 2010: the quiet-Sun term H_c 7.28e-5 with
+  ! lambda_c 40 Mm, the extended term H_ext 5e-7 with lambda_ext 0.7 R_sun,
+  ! which keeps the corona hot far out and drives the solar wind); 0 = off
+  real(dp) :: H_c = 0.0_dp, lambda_c_km = 4.0e4_dp, H_ext = 0.0_dp, lambda_ext_rsun = 0.7_dp
+  ! conduction blended to a collisionless flux far out (AWSoM, van der Holst
+  ! et al. 2014): q = f_S q_Spitzer + (1 - f_S) (3/2) alpha_cl p_e v_r (radial
+  ! faces), f_S = 1/(1 + (r/cond_r_rsun)^2); cond_r_rsun = 0: Spitzer only
+  real(dp) :: cond_r_rsun = 0.0_dp, alpha_cl = 1.05_dp
+  ! the hyperbolic conduction's relaxation time with the saturation factor
+  ! f_sat = 1/(1 + |F_Spitzer|/(1.5 rho c_s^3)) (Rempel 2017 eq. 16 with f_sat; he
+  ! left it out as conservative but later found no artifacts with it): in hot,
+  ! thin gas the flux saturates, tau drops and the flux follows its target
+  ! instead of lagging and overshooting (CZTR_3D 0.47 deg: temperature dips
+  ! above kG clusters collapsing to the floor); .false.: the unsaturated
+  ! diffusivity, as solar_model and CZTR_3D before 2026-11-15
+  logical  :: cond_tau_fsat = .true.
+  logical  :: use_conduction = .true., use_losses = .true., use_heating = .true.
+  real(dp) :: z_atm_km = 0.0_dp, w_atm_km = 3.0_dp
+  real(dp) :: H_peak = 1.0e-3_dp, z_heat_km = 1000.0_dp
+  real(dp) :: T_floor = 4400.0_dp, rho_floor = 1.0e-20_dp
+  real(dp) :: f_cfl_cond = 0.8_dp, dt_rad_factor = 0.1_dp
+  character(len=256) :: atomic_dir   = 'data/atomic'                        ! (copied from FALCON/TR/atomic_data)
+  character(len=256) :: coronal_file = 'data/atomic/RadCoolCorona_8.0.dat'   ! (from FALCON/TR)
+  ! the CZ cells 1..k_join held at their starting state after every step (CZTR step 2)
+  logical  :: freeze_cz = .false.
+  ! freeze_side: which side of the join is held at its starting state while
+  ! the other relaxes: 'none', 'cz' (the atmosphere relaxes over a frozen CZ;
+  ! freeze_cz = .true. is the same) or 'atmosphere' (the CZ relaxes under a
+  ! frozen atmosphere). The frozen side's blocks are not computed (they still
+  ! enter the multirate level assignment through their stable dt) and are
+  ! restored after every step; the join is a block face.
+  ! freeze_cz_mode (the boundary at the join): 'ghost' (the default): the
+  ! evolving side's radial ghost cells at the join, after every ghost fill:
+  ! v odd (v = 0 at the join face: line tied, no driving, no mass flux; the
+  ! radial mass flux r^2 rho v_r odd as at a face wall), B_theta, B_phi and psi
+  ! even (free), B_r, rho1 and s1 the frozen side's values for 'cz' (the
+  ! photosphere below; B_r fixed and continuous), B_r the frozen atmosphere's
+  ! and rho1 (relative to rho0), s1 even for 'atmosphere' (a wall for the CZ,
+  ! as CZ_3D's top). The frozen side's own cells are never changed: the CZ keeps
+  ! its convective velocities. This imposes only what the incoming
+  ! characteristics allow (v at the join; B_r continuous), as SWMF's inner
+  ! boundary. Older modes (freeze_side = 'cz' only): 'line_tied' (v = 0 in the
+  ! CZ cells themselves, B_h and psi free in its top freeze_float_cells cells;
+  ! runs/real1875_dpf.nml 2026-11-13), 'all' (every variable of the CZ restored,
+  ! v included: the runs before 2026-11-13).
+  ! import_cz_on_restart (with restart_from and import_dir): after reading the
+  ! restart, the CZ blocks (below the join) are overwritten from the export in
+  ! import_dir, all variables (e.g. mhd5's convection back under an
+  ! atmosphere relaxed with freeze_cz_mode = 'line_tied', which zeroed the
+  ! CZ's velocities)
+  logical :: import_cz_on_restart = .false.
+  ! atm_match_base (an import with the atmosphere, not a restart): each
+  ! column's lower atmosphere pressure-matched to its own CZ top. f = p(the
+  ! column's top CZ cell)/p(init_file's top CZ cell); init_file's atmosphere
+  ! density times f at its T, fully up to atm_match_z_km(1), not above
+  ! atm_match_z_km(2), a cos^2 step in between: in the chromosphere, where the
+  ! scale height is small (the step's force ~ f' H g); the TR, corona and wind
+  ! stay the common profile
+  ! TR broadening (as CZTR_2D; Lionello et al. 2009 form, only above
+  ! trac_Tlow): the Spitzer conductivity times 1/f(T) and the losses times
+  ! f(T), f = (T/trac_Tc)^(5/2 r(T)) below trac_Tc, r a smooth ramp in ln T
+  ! from 0 at trac_Tlow to 1 at 1.5 trac_Tlow; kappa Lambda and so the
+  ! conductive flux F(T) are unchanged, the TR between trac_Tlow and trac_Tc
+  ! is stretched by 1/f; everything below trac_Tlow is untouched. CZTR_2D's
+  ! recipe: 5e5, 1.2e4. trac_Tc = 0: off
+  real(dp) :: trac_Tc = 0.0_dp, trac_Tlow = 3.0e4_dp
+  ! si_radial: a radial semi-implicit term on v_r (MAS-like, radial only, as
+  ! CZTR_2D): rho dv_r/dt - (1/r^2) d/dr(r^2 rho S d/dr dv_r/dt) = rho R,
+  ! applied to every RK stage's v_r tendency (and the diffusion's v_r change,
+  ! si_diff_precond): one tridiagonal solve per column through its radial
+  ! blocks inside si_z_km, which sit on one rank (with si_radial the columns,
+  ! not the blocks, are distributed over the ranks). S = max(0, c^2 dt^2/
+  ! (si_cfl - C_f)^2 - dr^2/4), c = c_s (+ v_A), C_f = |v_r| dt/dr. In the
+  ! range the radial wave speed leaves the time step (|v_r|/dr stays) and the
+  ! radial diffusion speed is capped at si_diff_cap dr/dt; the two cells at
+  ! each end of the range stay explicit (S = 0, their wave speed in the step).
+  ! Steady states do not depend on S. Needs global steps (dt1 = 0, no
+  ! multirate) and nothing frozen.
+  logical :: si_radial = .false.
+  real(dp) :: si_cfl = 1.0_dp, si_diff_cap = 0.25_dp
+  ! si_z_km: the heights [km] of the implicit range, snapped to whole radial
+  ! blocks (default: the whole column)
+  real(dp) :: si_z_km(2) = [-1.0e30_dp, 1.0e30_dp]
+  logical :: si_diff_precond = .true.
+  ! si_alfven (with si_radial and a field): the same radial operator on
+  ! v_theta, v_phi with the radial Alfven speed |B_r|/sqrt(4 pi rho) (Boris
+  ! reduced); without it that speed stays in the radial CFL
+  logical :: si_alfven = .false.
+  ! wave_cfl_cs_only: the wave cap (wave_cfl_max) with c_s only (no Alfven speed)
+  logical :: wave_cfl_cs_only = .false.
+  ! wave_cfl_max > 0 (with si_radial): dt also <= wave_cfl_max dr/c in the
+  ! implicit range (a looser, smooth radial wave CFL; CZTR_2D: 1). 0 = off
+  real(dp) :: wave_cfl_max = 0.0_dp
+  logical :: atm_match_base = .true.
+  ! atm_match_on_restart: the same at a restart (e.g. the release after a CZ
+  ! relaxation under the frozen atmosphere, whose CZ top has moved on); it
+  ! overwrites the cells below atm_match_z_km(2) with the rescaled profile
+  logical :: atm_match_on_restart = .false.
+  real(dp) :: atm_match_z_km(2) = [300.0_dp, 1200.0_dp]
+  character(len=12) :: freeze_side = 'none'
+  character(len=12) :: freeze_cz_mode = 'ghost'
+  integer  :: freeze_float_cells = 2
+  ! diff_top_km above the photosphere: the full-diffusion weight falls from 1
+  ! at z = 0 to 0 at z = diff_top_above_km (cos^2), so it stays a band at the
+  ! CZ top when the atmosphere is in the domain
+  real(dp) :: diff_top_above_km = 50.0_dp
+
+  namelist /cz3d/ va_cap_horizontal, overlap_fills, grey_atm_blocks, b_eta_radial, phot_band_file, phot_n_lambda, phot_lambda_A, phot_z_km, euv_dt, euv_at_end, euv_trac, euv_n_view, euv_npix, euv_lon_deg, euv_lat_deg, euv_fov_rsun, euv_table, b_smooth_cells, test_freeze_b, b_eta_dr, b_eta_cs, test_b_diff_only, b_diff_form, b_diffusion_h, b_diff_limiter, cond_dB0_G, cond_dB_zj_km, cond_dB_w_km, si_alfven, wave_cfl_cs_only, trac_Tc, trac_Tlow, si_radial, si_cfl, si_diff_cap, si_z_km, si_diff_precond, wave_cfl_max, atm_match_base, atm_match_on_restart, atm_match_z_km, v_damp_time_s, v_damp_ramp_s, cond_tau_fsat, box_lat_deg, box_lon_deg, box_radius_deg, box_z_km, box_every, H_B_sat_G, import_cz_on_restart, freeze_side, v_damp_below_km, v_damp_above_km, v_damp_taper_km, freeze_cz_mode, freeze_float_cells, ghost_limiter, mf_iter, mf_alpha, dpf_edge_cells, dpf_eps, dpf_operator, dpf_tol, dpf_maxit, dpf_check, v_damp_n, v_damp_steps, v_damp_ramp, pfss_lmax, pfss_iter, pfss_check, plot_at_end, va_dt_target, va_floor_cs, H_B, lambda_B_km, n_gate, cond_along_b, b_iso_G, b_seed_rss_rsun, H_c, lambda_c_km, H_ext, lambda_ext_rsun, cond_r_rsun, alpha_cl, use_atmosphere, use_conduction, use_losses, use_heating, z_atm_km, w_atm_km, H_peak, z_heat_km, &
+      T_floor, rho_floor, f_cfl_cond, dt_rad_factor, atomic_dir, coronal_file, freeze_cz, diff_top_above_km, grid_file, init_file, table_file, opacity_file, out_dir, n_r_cells, n_theta, n_phi, nb_r, mr_levels, mr_extrapolate, mr_relevel, mr_relevel_dt, mr_by_shell, qconv_face, nb_theta, &
+      nb_phi, cfl, t_end, dt_max, n_step_max, n_log, dt_prof, plot_dt, use_radiation, use_convection, &
+      use_hyperbolic, alpha_mlt, L_bottom_Lsun, grey_tau_above, mlt_switch, mlt_R0, mlt_p, use_diffusion, &
+      use_minmod, diffusion_h, diff_top_km, diffusion_heating, wall_bottom, wall_top, ds1_random, c_target, rsst_q, rsst_form, yy_margin, refine_h, patch_level, patch_lat_deg, patch_lon_deg, patch_radius_deg, probe_lat_deg, probe_lon_deg, probe_radius_deg, probe_cells, g_from_background, restart_dt, dt_budget, restart_from, restart_domain_tol, restart_new_output, wall_time_max, wall_time_margin, wall_check_steps, r_top_rsun, top_energy, cool_width_km, cool_width_hp, dt1, prof_every, dt1_ramp_steps, dt1_hold_steps, grey_top_km, rsst_depth_km, dump_shells, omega_rot, coriolis, lz_correct_steps, lz_correct_dt, use_B, alpha_glm, glm_ch, glm_cfl_frac, b_diff_factor, va_max, b_bc_bottom, b_bc_top, b_seed, b_seed_G, b_seed_r1_rsun, b_seed_r2_rsun, export_state, import_dir, plot_blocks
+
+contains
+
+  subroutine read_params(file)
+    character(*), intent(in) :: file
+    type(arbor_config_t) :: cfg
+    integer :: ios
+    character(len=256) :: msg
+    call arbor_config_load(cfg, file)
+    call arbor_read_params(cfg)
+    read(cfg%lines, nml=cz3d, iostat=ios, iomsg=msg)
+    call arbor_config_check(cfg, 'cz3d', ios, msg)
+    if (wall_bottom /= 'face' .and. wall_bottom /= 'cell') call arbor_abort('wall_bottom must be face or cell')
+    if (wall_top /= 'face' .and. wall_top /= 'cell' .and. wall_top /= 'outflow') &
+        call arbor_abort('wall_top must be face, cell or outflow')
+    if (rsst_form /= 'hotta2012' .and. rsst_form /= 'hotta2015') call arbor_abort('rsst_form must be hotta2012 or hotta2015')
+    if (dt1 > 0.0_dp .and. dt_budget > 0.0_dp) call arbor_abort('dt1 (local time stepping) does not conserve energy: set dt_budget = 0')
+    if (use_B .and. dt_budget > 0.0_dp) call arbor_abort('the energy budget does not include the magnetic field: set dt_budget = 0')
+    if (use_B .and. rsst_form /= 'hotta2012') call arbor_abort('use_B needs rsst_form = hotta2012')
+    if (b_bc_bottom /= 'conductor' .and. b_bc_bottom /= 'radial') call arbor_abort('b_bc_bottom must be conductor or radial')
+    if (b_bc_top /= 'conductor' .and. b_bc_top /= 'radial') call arbor_abort('b_bc_top must be conductor or radial')
+    if (wall_time_max > 0.0_dp .and. wall_time_margin >= wall_time_max) call arbor_abort('wall_time_margin must be below wall_time_max')
+    if (wall_check_steps < 1) call arbor_abort('wall_check_steps must be >= 1')
+    if (coriolis /= 'split' .and. coriolis /= 'rk') call arbor_abort('coriolis must be split or rk')
+    if (glm_ch /= 'fast' .and. glm_ch /= 'cfl') call arbor_abort('glm_ch must be fast or cfl')
+    if (b_seed /= 'none' .and. b_seed /= 'toroidal' .and. b_seed /= 'dipole' .and. b_seed /= 'pfss' &
+        .and. b_seed /= 'dpf') call arbor_abort('b_seed must be none, toroidal, dipole, pfss or dpf')
+    if (import_cz_on_restart .and. (len_trim(restart_from) == 0 .or. len_trim(import_dir) == 0 .or. .not. use_atmosphere)) &
+        call arbor_abort('import_cz_on_restart needs restart_from, import_dir and use_atmosphere')
+    if (freeze_cz .and. freeze_side == 'none') freeze_side = 'cz'
+    if (freeze_side /= 'none' .and. freeze_side /= 'cz' .and. freeze_side /= 'atmosphere') &
+        call arbor_abort('freeze_side must be none, cz or atmosphere')
+    if (freeze_side /= 'none' .and. .not. use_atmosphere) call arbor_abort('freeze_side needs use_atmosphere (a join)')
+    freeze_cz = freeze_side /= 'none'
+    if (freeze_cz_mode /= 'ghost' .and. freeze_cz_mode /= 'line_tied' .and. freeze_cz_mode /= 'all') &
+        call arbor_abort('freeze_cz_mode must be ghost, line_tied or all')
+    if (freeze_side == 'atmosphere' .and. freeze_cz_mode /= 'ghost') &
+        call arbor_abort('freeze_side = atmosphere needs freeze_cz_mode = ghost')
+    if (si_radial .and. (dt1 > 0.0_dp .or. mr_levels > 1)) call arbor_abort('si_radial needs global steps (dt1 = 0, mr_levels <= 1)')
+    if (b_diff_form /= 'component' .and. b_diff_form /= 'resistive') call arbor_abort('b_diff_form must be component or resistive')
+    if (use_B .and. use_diffusion .and. b_diff_form == 'resistive' .and. .not. si_radial) &
+        call arbor_abort("b_diff_form = 'resistive' needs si_radial (its radial term is solved per column)")
+    if (b_eta_dr > 0.0_dp .and. b_diff_form /= 'resistive') call arbor_abort("b_eta_dr needs b_diff_form = 'resistive'")
+    if (b_eta_radial /= 'implicit' .and. b_eta_radial /= 'explicit') call arbor_abort("b_eta_radial must be implicit or explicit")
+    if (grey_atm_blocks > 0 .and. .not. (use_atmosphere .and. si_radial .and. use_radiation)) &
+        call arbor_abort('grey_atm_blocks needs use_atmosphere, si_radial (whole columns per rank) and use_radiation')
+    b_eta_explicit = b_eta_radial == 'explicit'
+    phot_on = phot_n_lambda > 0 .or. len_trim(phot_band_file) > 0
+    if ((euv_dt > 0.0_dp .or. euv_at_end) .and. .not. use_atmosphere .and. .not. phot_on) &
+        call arbor_abort('euv_dt/euv_at_end need use_atmosphere (or phot_n_lambda > 0 for continuum images only)')
+    if (phot_n_lambda < 0 .or. phot_n_lambda > phot_max_lambda) call arbor_abort('phot_n_lambda must be 0 .. 4')
+    if (phot_n_lambda > 0 .and. len_trim(phot_band_file) == 0) then
+      if (any(phot_lambda_A(1:phot_n_lambda) < 1300.0_dp)) &
+          call arbor_abort('phot_lambda_A must be >= 1300 A (the metal bound-free list starts there)')
+      if (phot_z_km(2) <= phot_z_km(1)) call arbor_abort('phot_z_km must be increasing')
+    end if
+    if (euv_n_view < 1 .or. euv_n_view > euv_max_view) call arbor_abort('euv_n_view must be 1 .. euv_max_view (8)')
+    if (euv_npix < 8 .or. euv_fov_rsun <= 1.0_dp) call arbor_abort('euv_npix must be >= 8 and euv_fov_rsun > 1')
+    if (b_diff_limiter /= 'minmod' .and. b_diff_limiter /= 'mc') call arbor_abort('b_diff_limiter must be minmod or mc')
+    if (si_alfven .and. .not. (si_radial .and. use_B)) call arbor_abort('si_alfven needs si_radial and use_B')
+    if (si_radial .and. freeze_side /= 'none') call arbor_abort('si_radial needs freeze_side = none')
+    if (si_radial .and. si_z_km(2) <= si_z_km(1)) call arbor_abort('si_z_km(2) must exceed si_z_km(1)')
+    if (atm_match_z_km(2) <= atm_match_z_km(1)) call arbor_abort('atm_match_z_km(2) must exceed atm_match_z_km(1)')
+    if (freeze_float_cells < 0) call arbor_abort('freeze_float_cells must be >= 0')
+    if (ghost_limiter /= 'minmod' .and. ghost_limiter /= 'mc' .and. ghost_limiter /= 'none') &
+        call arbor_abort('ghost_limiter must be minmod, mc or none')
+    if (dpf_operator /= 'wide' .and. dpf_operator /= 'compact') call arbor_abort('dpf_operator must be wide or compact')
+    if ((b_seed == 'pfss' .or. b_seed == 'dpf') .and. .not. (use_B .and. use_atmosphere)) &
+        call arbor_abort('b_seed = pfss or dpf needs use_B and use_atmosphere (the field above the join)')
+    if (top_energy /= 'eddington' .and. top_energy /= 'cooling') call arbor_abort('top_energy must be eddington or cooling')
+    ! (local time stepping, dt1 > 0, works with the atmosphere: relaxation, e.g. of the wind)
+    if (use_atmosphere .and. dt_budget > 0.0_dp) call arbor_abort('use_atmosphere needs dt_budget = 0')
+    if (use_atmosphere .and. top_energy /= 'eddington') call arbor_abort('use_atmosphere needs top_energy = eddington')
+  end subroutine read_params
+
+end module cz3d_params_mod

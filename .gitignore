@@ -1,0 +1,36 @@
+# run output (large) and builds
+output/
+build/
+*.x
+*.o
+*.mod
+*.rst
+*.plt
+
+# generated inputs (`make data`): EOS-derived, rebuilt on each machine
+data/eos_table.bin
+data/static_init*.dat
+# generated radial grids (make data/static_init_<name>.dat); kept: the two below
+data/grid_*.dat
+!data/grid_full.dat
+!data/grid_r141.dat
+# the 0.47 deg production grid (c196_m0_r2c10_*): the Studio's exact files.
+# Regenerating them elsewhere changes the last digits, and restarts compare
+# the grid exactly (restart_domain_tol = 0)
+!data/grid_015a1.dat
+!data/static_init_015a1.dat
+data/static_profile.dat
+
+# Python, editors, OS
+__pycache__/
+*.pyc
+.DS_Store
+.vscode/
+*.dSYM/
+config.mk
+!data/grid_atm25.dat
+!data/init_atm25.dat
+!data/grid_atm20.dat
+!data/init_atm20.dat
+data/eos_table_wind.bin
+!data/init_wind20.dat
