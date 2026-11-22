@@ -753,81 +753,82 @@ contains
   ! siSa_B for v_theta, v_phi); Thomas algorithm (the rows are diagonally
   ! dominant). X2 (optional): a second right-hand side with the same matrix
   ! (v_theta and v_phi), eliminated with the same multipliers.
-  ! All (j, k) columns of a column stack at once, (j, k) the inner index:
-  ! the recursion runs in r, each step a vector operation over the columns
-  ! (the same arithmetic per column); a column whose S is 0 everywhere keeps
-  ! its X (the identity, not solved)
+  ! The columns of a column stack in groups of one row (fixed k, the nb(2)
+  ! columns j), j the inner index: the recursion runs in r, each step a
+  ! vector operation over the row's columns (the same arithmetic per column);
+  ! a row-sized group keeps the work arrays in cache (all nb(2) nb(3) columns
+  ! at once, 1024 x 336 cells with 32 x 32 blocks, streamed from memory); a
+  ! column whose S is 0 everywhere keeps its X (the identity, not solved)
   subroutine si_column_solve(X, SS, X2)
     real(dp), intent(inout) :: X(:, :, :, :)
     real(dp), intent(in) :: SS(:, :, :, :)
     real(dp), intent(inout), optional :: X2(:, :, :, :)
-    integer :: c, q, i, j, k, m, nk, n, g, ib, njk, jk
+    integer :: c, q, i, j, k, m, nk, n, g, ib, nj
     real(dp), allocatable :: a(:,:), b(:,:), cc(:,:), d(:,:), d2(:,:), wf(:,:), rp(:,:), sv(:,:), w(:), smax(:)
-    real(dp) :: vol
+    real(dp), allocatable :: vol(:), rdc(:)
     logical :: two
     two = present(X2)
     nk = si_kb1 - si_kb0 + 1
     m = nk*nb(1)
-    njk = nb(2)*nb(3)
-    allocate(a(njk, m), b(njk, m), cc(njk, m), d(njk, m), wf(njk, 0:m), rp(njk, m), sv(njk, m), w(njk), smax(njk))
-    if (two) allocate(d2(njk, m))
+    nj = nb(2)
+    allocate(a(nj, m), b(nj, m), cc(nj, m), d(nj, m), wf(nj, 0:m), rp(nj, m), sv(nj, m), w(nj), smax(nj))
+    allocate(vol(m), rdc(m))
+    if (two) allocate(d2(nj, m))
     call cz_unbind()                                   ! (the global radial arrays)
+    do n = 1, m
+      g = si_i0 - 1 + n
+      vol(n) = r_f(g) - r_f(g-1)
+      rdc(n) = r_c(g+1) - r_c(g)
+    end do
     do c = 1, si_ncol
-      ! the column stack's values, (j, k) inner
-      do q = 1, nk
-        ib = si_cb(q, c)
-        do k = 1, nb(3)
-          do j = 1, nb(2)
-            jk = j + (k - 1)*nb(2)
-            do i = 1, nb(1)
-              n = (q - 1)*nb(1) + i
-              g = si_i0 - 1 + n
-              rp(jk, n) = rho0(g) + rq(g)*State_GVB(i, j, k, rho1_, ib)
-              sv(jk, n) = SS(i, j, k, ib)
-              d(jk, n) = X(i, j, k, ib)
-              if (two) d2(jk, n) = X2(i, j, k, ib)
+      do k = 1, nb(3)
+        ! the row's values, j inner
+        do q = 1, nk
+          ib = si_cb(q, c)
+          do i = 1, nb(1)
+            n = (q - 1)*nb(1) + i
+            g = si_i0 - 1 + n
+            do j = 1, nj
+              rp(j, n) = rho0(g) + rq(g)*State_GVB(i, j, k, rho1_, ib)
+              sv(j, n) = SS(i, j, k, ib)
+              d(j, n) = X(i, j, k, ib)
             end do
+            if (two) d2(:, n) = X2(i, 1:nj, k, ib)
           end do
         end do
-      end do
-      smax = maxval(sv, dim=2)
-      if (all(smax <= 0.0_dp)) cycle
-      wf(:, 0) = 0.0_dp;  wf(:, m) = 0.0_dp
-      do n = 1, m - 1
-        g = si_i0 - 1 + n
-        wf(:, n) = 0.25_dp*(rp(:, n) + rp(:, n+1))*(sv(:, n) + sv(:, n+1))/(r_c(g+1) - r_c(g))
-      end do
-      do n = 1, m
-        g = si_i0 - 1 + n
-        vol = r_f(g) - r_f(g-1)
-        a(:, n) = -wf(:, n-1)
-        cc(:, n) = -wf(:, n)
-        b(:, n) = vol*rp(:, n) + wf(:, n-1) + wf(:, n)
-        d(:, n) = vol*rp(:, n)*d(:, n)
-        if (two) d2(:, n) = vol*rp(:, n)*d2(:, n)
-      end do
-      do n = 2, m
-        w = a(:, n)/b(:, n-1)
-        b(:, n) = b(:, n) - w*cc(:, n-1)
-        d(:, n) = d(:, n) - w*d(:, n-1)
-        if (two) d2(:, n) = d2(:, n) - w*d2(:, n-1)
-      end do
-      d(:, m) = d(:, m)/b(:, m)
-      if (two) d2(:, m) = d2(:, m)/b(:, m)
-      do n = m - 1, 1, -1
-        d(:, n) = (d(:, n) - cc(:, n)*d(:, n+1))/b(:, n)
-        if (two) d2(:, n) = (d2(:, n) - cc(:, n)*d2(:, n+1))/b(:, n)
-      end do
-      do q = 1, nk
-        ib = si_cb(q, c)
-        do k = 1, nb(3)
-          do j = 1, nb(2)
-            jk = j + (k - 1)*nb(2)
-            if (smax(jk) <= 0.0_dp) cycle              ! (S = 0 in the whole column: X as it was)
-            do i = 1, nb(1)
-              n = (q - 1)*nb(1) + i
-              X(i, j, k, ib) = d(jk, n)
-              if (two) X2(i, j, k, ib) = d2(jk, n)
+        smax = maxval(sv, dim=2)
+        if (all(smax <= 0.0_dp)) cycle
+        wf(:, 0) = 0.0_dp;  wf(:, m) = 0.0_dp
+        do n = 1, m - 1
+          wf(:, n) = 0.25_dp*(rp(:, n) + rp(:, n+1))*(sv(:, n) + sv(:, n+1))/rdc(n)
+        end do
+        do n = 1, m
+          a(:, n) = -wf(:, n-1)
+          cc(:, n) = -wf(:, n)
+          b(:, n) = vol(n)*rp(:, n) + wf(:, n-1) + wf(:, n)
+          d(:, n) = vol(n)*rp(:, n)*d(:, n)
+          if (two) d2(:, n) = vol(n)*rp(:, n)*d2(:, n)
+        end do
+        do n = 2, m
+          w = a(:, n)/b(:, n-1)
+          b(:, n) = b(:, n) - w*cc(:, n-1)
+          d(:, n) = d(:, n) - w*d(:, n-1)
+          if (two) d2(:, n) = d2(:, n) - w*d2(:, n-1)
+        end do
+        d(:, m) = d(:, m)/b(:, m)
+        if (two) d2(:, m) = d2(:, m)/b(:, m)
+        do n = m - 1, 1, -1
+          d(:, n) = (d(:, n) - cc(:, n)*d(:, n+1))/b(:, n)
+          if (two) d2(:, n) = (d2(:, n) - cc(:, n)*d2(:, n+1))/b(:, n)
+        end do
+        do q = 1, nk
+          ib = si_cb(q, c)
+          do i = 1, nb(1)
+            n = (q - 1)*nb(1) + i
+            do j = 1, nj
+              if (smax(j) <= 0.0_dp) cycle              ! (S = 0 in the whole column: X as it was)
+              X(i, j, k, ib) = d(j, n)
+              if (two) X2(i, j, k, ib) = d2(j, n)
             end do
           end do
         end do
@@ -1598,7 +1599,7 @@ contains
   subroutine rhs(ib)
     integer, intent(in) :: ib
     integer :: i, j, k, c
-    real(dp) :: rho, vr
+    real(dp) :: rho, vr, pz, px, py, sbg(nb(1))
     call tic(T_R_EOS)
     if (.not. eos_fresh) call derived(ib, D_P1, C_ALL)
     eos_fresh = .false.
@@ -1621,87 +1622,94 @@ contains
         end do
       end do
     end do
+    ! the horizontal part: rho v stored once (W_G), its derivatives inline
+    ! (fusing the products into the stencils recomputes each 4 times: slower)
+    associate (ix => Metric_DB(2, ib)%DiDx_I, iy => Metric_DB(3, ib)%DiDx_I)
     do k = 1 - ng, nb(3) + ng
       do j = 1 - ng, nb(2) + ng
-        do i = 1 - ng, nb(1) + ng
+        do i = 1, nb(1)
           W_G(i, j, k) = rho_G(i, j, k)*State_GVB(i, j, k, vt_, ib)
+          B_GV(i, j, k, 1) = rho_G(i, j, k)*State_GVB(i, j, k, vp_, ib)
         end do
       end do
     end do
-    call arbor_deriv_cell(W_G, 2, ib, D_C)
-    do k = 1 - ng, nb(3) + ng
-      do j = 1 - ng, nb(2) + ng
-        do i = 1 - ng, nb(1) + ng
-          W_G(i, j, k) = rho_G(i, j, k)*State_GVB(i, j, k, vp_, ib)
-        end do
-      end do
-    end do
-    call arbor_deriv_cell(W_G, 3, ib, Dr_C)
     do k = 1, nb(3)
       do j = 1, nb(2)
+!GCC$ ivdep
+!DIR$ IVDEP
         do i = 1, nb(1)
-          R_CV(i, j, k, rho1_) = R_CV(i, j, k, rho1_) - (D_C(i, j, k) + Dr_C(i, j, k))
+          R_CV(i, j, k, rho1_) = R_CV(i, j, k, rho1_) - ( &
+              dh4(W_G(i, j-2, k), W_G(i, j-1, k), W_G(i, j+1, k), W_G(i, j+2, k), ix(j)) &
+            + dh4(B_GV(i, j, k-2, 1), B_GV(i, j, k-1, 1), B_GV(i, j, k+1, 1), B_GV(i, j, k+2, 1), iy(k)))
           if (rsst_h2012) R_CV(i, j, k, rho1_) = R_CV(i, j, k, rho1_)/xi(i)**2
         end do
       end do
     end do
+    end associate
 
     call toc(T_R_MASS)
     ! ---- momentum and entropy: advection -(v.grad) q for q = v_z, v_x, v_y, s1
     call tic(T_R_ADV)
+    associate (ix => Metric_DB(2, ib)%DiDx_I, iy => Metric_DB(3, ib)%DiDx_I)
     do c = vr_, s1_
-      call ddr_block(State_GVB(:, :, :, c, ib), Dr_C)
       do k = 1, nb(3)
         do j = 1, nb(2)
           do i = 1, nb(1)
-            R_CV(i, j, k, c) = -State_GVB(i, j, k, vr_, ib)*Dr_C(i, j, k)
-          end do
-        end do
-      end do
-      call arbor_deriv_cell(State_GVB, c, 2, ib, D_C)
-      call arbor_deriv_cell(State_GVB, c, 3, ib, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          do i = 1, nb(1)
-            R_CV(i, j, k, c) = R_CV(i, j, k, c) - State_GVB(i, j, k, vt_, ib)*D_C(i, j, k) &
-                - State_GVB(i, j, k, vp_, ib)*Dr_C(i, j, k)
+            R_CV(i, j, k, c) = -State_GVB(i, j, k, vr_, ib)*dz4(State_GVB(i-2, j, k, c, ib), State_GVB(i-1, j, k, c, ib), &
+                State_GVB(i+1, j, k, c, ib), State_GVB(i+2, j, k, c, ib), drdxi_c(i)) &
+                - State_GVB(i, j, k, vt_, ib)*dh4(State_GVB(i, j-2, k, c, ib), State_GVB(i, j-1, k, c, ib), &
+                State_GVB(i, j+1, k, c, ib), State_GVB(i, j+2, k, c, ib), ix(j)) &
+                - State_GVB(i, j, k, vp_, ib)*dh4(State_GVB(i, j, k-2, c, ib), State_GVB(i, j, k-1, c, ib), &
+                State_GVB(i, j, k+1, c, ib), State_GVB(i, j, k+2, c, ib), iy(k))
           end do
         end do
       end do
     end do
+    end associate
 
     call toc(T_R_ADV)
     ! ---- pressure gradient, gravity on rho1, ds0/dz
     call tic(T_R_PRS)
-    call ddr_block(p1_G, Dr_C)
+    ! (branch-free so the loop vectorizes: the atmosphere's background-force
+    ! term per cell, 0 without the atmosphere (R - 0/rho = R exactly); the
+    ! energy budget's work in a loop of its own)
+    do i = 1, nb(1)
+      sbg(i) = 0.0_dp
+      if (use_atmosphere) sbg(i) = S_bgf(r_off + i)*bgforce(r_off + i)
+    end do
+    associate (ix => Metric_DB(2, ib)%DiDx_I, iy => Metric_DB(3, ib)%DiDx_I)
     do k = 1, nb(3)
       do j = 1, nb(2)
+!GCC$ ivdep
+!DIR$ IVDEP
         do i = 1, nb(1)
           rho = rho_G(i, j, k)
-          R_CV(i, j, k, vr_) = R_CV(i, j, k, vr_) - (Dr_C(i, j, k) + g_c(i)*rq(i)*State_GVB(i, j, k, rho1_, ib))/rho
-          if (use_atmosphere) R_CV(i, j, k, vr_) = R_CV(i, j, k, vr_) - S_bgf(r_off + i)*bgforce(r_off + i)/rho
-          if (want_work) work_CB(i, j, k, ib) = -State_GVB(i, j, k, vr_, ib) &
-              *(Dr_C(i, j, k) + g_c(i)*rq(i)*State_GVB(i, j, k, rho1_, ib))
+          pz = dz4(p1_G(i-2, j, k), p1_G(i-1, j, k), p1_G(i+1, j, k), p1_G(i+2, j, k), drdxi_c(i))
+          px = dh4(p1_G(i, j-2, k), p1_G(i, j-1, k), p1_G(i, j+1, k), p1_G(i, j+2, k), ix(j))
+          py = dh4(p1_G(i, j, k-2), p1_G(i, j, k-1), p1_G(i, j, k+1), p1_G(i, j, k+2), iy(k))
+          R_CV(i, j, k, vr_) = R_CV(i, j, k, vr_) - (pz + g_c(i)*rq(i)*State_GVB(i, j, k, rho1_, ib))/rho - sbg(i)/rho
+          R_CV(i, j, k, vt_) = R_CV(i, j, k, vt_) - px/rho
+          R_CV(i, j, k, vp_) = R_CV(i, j, k, vp_) - py/rho
+          R_CV(i, j, k, s1_) = R_CV(i, j, k, s1_) - State_GVB(i, j, k, vr_, ib)*ds0dr(i)
         end do
       end do
     end do
-    call arbor_deriv_cell(p1_G, 2, ib, D_C)
-    call arbor_deriv_cell(p1_G, 3, ib, Dr_C)
-    do k = 1, nb(3)
-      do j = 1, nb(2)
-        do i = 1, nb(1)
-          rho = rho_G(i, j, k)
-          vr = State_GVB(i, j, k, vr_, ib)
-          if (want_work) then
-            workh_CB(i, j, k, ib) = -State_GVB(i, j, k, vt_, ib)*D_C(i, j, k) - State_GVB(i, j, k, vp_, ib)*Dr_C(i, j, k)
+    if (want_work) then
+      do k = 1, nb(3)
+        do j = 1, nb(2)
+          do i = 1, nb(1)
+            vr = State_GVB(i, j, k, vr_, ib)
+            pz = dz4(p1_G(i-2, j, k), p1_G(i-1, j, k), p1_G(i+1, j, k), p1_G(i+2, j, k), drdxi_c(i))
+            px = dh4(p1_G(i, j-2, k), p1_G(i, j-1, k), p1_G(i, j+1, k), p1_G(i, j+2, k), ix(j))
+            py = dh4(p1_G(i, j, k-2), p1_G(i, j, k-1), p1_G(i, j, k+1), p1_G(i, j, k+2), iy(k))
+            work_CB(i, j, k, ib) = -vr*(pz + g_c(i)*rq(i)*State_GVB(i, j, k, rho1_, ib))
+            workh_CB(i, j, k, ib) = -State_GVB(i, j, k, vt_, ib)*px - State_GVB(i, j, k, vp_, ib)*py
             work_CB(i, j, k, ib) = work_CB(i, j, k, ib) + workh_CB(i, j, k, ib)
-          end if
-          R_CV(i, j, k, vt_) = R_CV(i, j, k, vt_) - D_C(i, j, k)/rho
-          R_CV(i, j, k, vp_) = R_CV(i, j, k, vp_) - Dr_C(i, j, k)/rho
-          R_CV(i, j, k, s1_) = R_CV(i, j, k, s1_) - vr*ds0dr(i)
+          end do
         end do
       end do
-    end do
+    end if
+    end associate
     call toc(T_R_PRS)
     if (use_B) call rhs_mhd(ib)
   end subroutine rhs
@@ -1749,17 +1757,23 @@ contains
     call curl_block(B_GV, ib, C_CV)
     ! div B and grad psi
     call div_block(State_GVB(:, :, :, br_:bp_, ib), ib, divB_C)
-    call ddr_block(State_GVB(:, :, :, psi_, ib), Dr_C)
-    R_CV(:, :, :, br_) = C_CV(:, :, :, 1) - Dr_C
-    call arbor_deriv_cell(State_GVB, psi_, 2, ib, D_C)
+    ! R_B = curl E - grad psi (the stencils inline)
+    associate (ix => Metric_DB(2, ib)%DiDx_I, iy => Metric_DB(3, ib)%DiDx_I)
     do k = 1, nb(3)
       do j = 1, nb(2)
+!GCC$ ivdep
+!DIR$ IVDEP
         do i = 1, nb(1)
-          R_CV(i, j, k, bt_) = C_CV(i, j, k, 2) - D_C(i, j, k)
+          R_CV(i, j, k, br_) = C_CV(i, j, k, 1) - dz4(State_GVB(i-2, j, k, psi_, ib), State_GVB(i-1, j, k, psi_, ib), &
+              State_GVB(i+1, j, k, psi_, ib), State_GVB(i+2, j, k, psi_, ib), drdxi_c(i))
+          R_CV(i, j, k, bt_) = C_CV(i, j, k, 2) - dh4(State_GVB(i, j-2, k, psi_, ib), State_GVB(i, j-1, k, psi_, ib), &
+              State_GVB(i, j+1, k, psi_, ib), State_GVB(i, j+2, k, psi_, ib), ix(j))
+          R_CV(i, j, k, bp_) = C_CV(i, j, k, 3) - dh4(State_GVB(i, j, k-2, psi_, ib), State_GVB(i, j, k-1, psi_, ib), &
+              State_GVB(i, j, k+1, psi_, ib), State_GVB(i, j, k+2, psi_, ib), iy(k))
         end do
       end do
     end do
-    call arbor_deriv_cell(State_GVB, psi_, 3, ib, D_C)
+    end associate
     call toc(T_R_MCURL)
     call tic(T_R_MLOOP)
     ! The Lorentz force with its cap factor and the GLM source. cell_cs,
@@ -1775,7 +1789,6 @@ contains
 !GCC$ ivdep
 !DIR$ IVDEP
           do i = 1, nb(1)
-            R_CV(i, j, k, bp_) = C_CV(i, j, k, 3) - D_C(i, j, k)
             b = State_GVB(i, j, k, br_:bp_, ib)
             jj = J_CV(i, j, k, :)
             rho = rho_G(i, j, k)
@@ -1816,63 +1829,60 @@ contains
     integer, intent(in) :: ib
     real(dp), intent(out) :: C(:, :, :, :)
     integer :: i, j, k
-    ! C_z
-    call arbor_deriv_cell(A_GV(:, :, :, 3), 2, ib, D_C)
-    call arbor_deriv_cell(A_GV(:, :, :, 2), 3, ib, Dr_C)
+    ! (one pass, the stencils inline: dz4 CZTR's vertical, dh4 ARBOR's horizontal arithmetic)
+    associate (ix => Metric_DB(2, ib)%DiDx_I, iy => Metric_DB(3, ib)%DiDx_I)
     do k = 1, nb(3)
       do j = 1, nb(2)
+        ! (each iteration writes only its own cell: no dependence between them)
+!GCC$ ivdep
+!DIR$ IVDEP
         do i = 1, nb(1)
-          C(i, j, k, 1) = D_C(i, j, k) - Dr_C(i, j, k)
+          C(i, j, k, 1) = dh4(A_GV(i, j-2, k, 3), A_GV(i, j-1, k, 3), A_GV(i, j+1, k, 3), A_GV(i, j+2, k, 3), ix(j)) &
+              - dh4(A_GV(i, j, k-2, 2), A_GV(i, j, k-1, 2), A_GV(i, j, k+1, 2), A_GV(i, j, k+2, 2), iy(k))
+          C(i, j, k, 2) = dh4(A_GV(i, j, k-2, 1), A_GV(i, j, k-1, 1), A_GV(i, j, k+1, 1), A_GV(i, j, k+2, 1), iy(k)) &
+              - dz4(A_GV(i-2, j, k, 3), A_GV(i-1, j, k, 3), A_GV(i+1, j, k, 3), A_GV(i+2, j, k, 3), drdxi_c(i))
+          C(i, j, k, 3) = dz4(A_GV(i-2, j, k, 2), A_GV(i-1, j, k, 2), A_GV(i+1, j, k, 2), A_GV(i+2, j, k, 2), drdxi_c(i)) &
+              - dh4(A_GV(i, j-2, k, 1), A_GV(i, j-1, k, 1), A_GV(i, j+1, k, 1), A_GV(i, j+2, k, 1), ix(j))
         end do
       end do
     end do
-    ! C_x
-    call arbor_deriv_cell(A_GV(:, :, :, 1), 3, ib, D_C)
-    call ddr_block(A_GV(:, :, :, 3), Dr_C)
-    do k = 1, nb(3)
-      do j = 1, nb(2)
-        do i = 1, nb(1)
-          C(i, j, k, 2) = D_C(i, j, k) - Dr_C(i, j, k)
-        end do
-      end do
-    end do
-    ! C_y
-    call ddr_block(A_GV(:, :, :, 2), Dr_C)
-    call arbor_deriv_cell(A_GV(:, :, :, 1), 2, ib, D_C)
-    do k = 1, nb(3)
-      do j = 1, nb(2)
-        do i = 1, nb(1)
-          C(i, j, k, 3) = Dr_C(i, j, k) - D_C(i, j, k)
-        end do
-      end do
-    end do
+    end associate
   end subroutine curl_block
 
   ! Divergence of the Cartesian vector A_GV = (A_z, A_x, A_y) at the interior
-  ! cells: d_z A_z + d_x A_x + d_y A_y
+  ! cells: d_z A_z + d_x A_x + d_y A_y (one pass, the stencils inline)
   subroutine div_block(A_GV, ib, Dv)
     real(dp), intent(in) :: A_GV(1-ng:, 1-ng:, 1-ng:, :)
     integer, intent(in) :: ib
     real(dp), intent(out) :: Dv(:, :, :)
     integer :: i, j, k
-    call ddr_block(A_GV(:, :, :, 1), Dr_C)
+    real(dp) :: dx, dy
+    associate (ix => Metric_DB(2, ib)%DiDx_I, iy => Metric_DB(3, ib)%DiDx_I)
     do k = 1, nb(3)
       do j = 1, nb(2)
         do i = 1, nb(1)
-          Dv(i, j, k) = Dr_C(i, j, k)
+          dx = dh4(A_GV(i, j-2, k, 2), A_GV(i, j-1, k, 2), A_GV(i, j+1, k, 2), A_GV(i, j+2, k, 2), ix(j))
+          dy = dh4(A_GV(i, j, k-2, 3), A_GV(i, j, k-1, 3), A_GV(i, j, k+1, 3), A_GV(i, j, k+2, 3), iy(k))
+          Dv(i, j, k) = dz4(A_GV(i-2, j, k, 1), A_GV(i-1, j, k, 1), A_GV(i+1, j, k, 1), A_GV(i+2, j, k, 1), drdxi_c(i)) &
+              + dx + dy
         end do
       end do
     end do
-    call arbor_deriv_cell(A_GV(:, :, :, 2), 2, ib, D_C)
-    call arbor_deriv_cell(A_GV(:, :, :, 3), 3, ib, Dr_C)
-    do k = 1, nb(3)
-      do j = 1, nb(2)
-        do i = 1, nb(1)
-          Dv(i, j, k) = Dv(i, j, k) + D_C(i, j, k) + Dr_C(i, j, k)
-        end do
-      end do
-    end do
+    end associate
   end subroutine div_block
+
+  ! The 4th-order cell derivatives, the arithmetic of the block routines they
+  ! replace: dz4 CZTR's vertical stencil (ddr_block, dd = dr/dxi), dh4
+  ! ARBOR's horizontal one (arbor_deriv_cell's d_cell, didx = di/dx)
+  pure real(dp) function dz4(fm2, fm1, fp1, fp2, dd)
+    real(dp), intent(in) :: fm2, fm1, fp1, fp2, dd
+    dz4 = (fm2 - 8.0_dp*fm1 + 8.0_dp*fp1 - fp2)/(12.0_dp*dd)
+  end function dz4
+  pure real(dp) function dh4(fm2, fm1, fp1, fp2, didx)
+    real(dp), intent(in) :: fm2, fm1, fp1, fp2, didx
+    real(dp), parameter :: c12 = 1.0_dp/12.0_dp
+    dh4 = c12*(fm2 - fp2 + 8.0_dp*(fp1 - fm1))*didx
+  end function dh4
 
   ! The GLM cleaning speed of a cell: c_s0/xi + v_A ('fast'; v_A capped, see
   ! va_eff), or the largest its step allows ('cfl', see glm_ch), at least the former

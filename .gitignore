@@ -34,3 +34,5 @@ config.mk
 !data/init_atm20.dat
 data/eos_table_wind.bin
 !data/init_wind20.dat
+build-nofma/
+*-nofma.x

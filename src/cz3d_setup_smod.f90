@@ -130,7 +130,8 @@ contains
     allocate(F1_FV(0:nb(1), nb(2), nb(3), ie_), F2_FV(nb(1), 0:nb(2), nb(3), ie_), &
         F3_FV(nb(1), nb(2), 0:nb(3), ie_), Div_CV(nb(1), nb(2), nb(3), ie_))
     allocate(C1_F(0:nb(1), nb(2), nb(3)), C2_F(nb(1), 0:nb(2), nb(3)), C3_F(nb(1), nb(2), 0:nb(3)))
-    if (use_B) allocate(B_GV(1-ng:nb(1)+ng, 1-ng:nb(2)+ng, 1-ng:nb(3)+ng, 3), C_CV(nb(1), nb(2), nb(3), 3), &
+    allocate(B_GV(1-ng:nb(1)+ng, 1-ng:nb(2)+ng, 1-ng:nb(3)+ng, 3))       ! (also the mass flux's scratch: rhs)
+    if (use_B) allocate(C_CV(nb(1), nb(2), nb(3), 3), &
         J_CV(nb(1), nb(2), nb(3), 3), divB_C(nb(1), nb(2), nb(3)), vA_G(1-ng:nb(1)+ng, 1-ng:nb(2)+ng, 1-ng:nb(3)+ng))
   end subroutine cz_setup
 

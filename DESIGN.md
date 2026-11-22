@@ -239,6 +239,22 @@ column solves 11%: mostly the transposition), ghost fills 12%, the interior
 EOS during the fills 8%, energy transport 8%, atmosphere 5% + losses during
 the fill 5%, stable_dt 4%, the potential top 2%, outputs 2.5%.
 
+Optimization (2026-11-22, bit-identical: the -ffp-contract=off builds,
+tools/build_nofma.sh, give the same checksums as before for smoke_atm and
+smoke_hd; laptop timings vary +-10% run to run):
+- The column solves in row groups (fixed k, nb(2) columns) instead of all
+  nb(2) nb(3) columns of a stack at once: the work arrays stay in cache.
+  128^2: 1.41 -> 0.64 s per 20 steps (16^2 blocks), 2.40 -> 0.64 s (32^2
+  blocks); the step 12.9 -> ~11.1 s per 20 steps. (Generic: also for CZTR_3D.)
+- The RHS derivatives fused (inline stencils dz4, dh4 with the block routines'
+  arithmetic; ivdep and a branch-free pressure loop so they vectorize):
+  advection 0.39 -> 0.30, pressure 0.17 -> 0.13, curls/div 0.60 -> 0.55,
+  Lorentz/psi 0.48 -> 0.43 s per 20 steps; mass kept with rho v stored once
+  (fused it recomputes the products, 0.17 -> 0.22). About 2% of the step: the
+  RHS was not memory bound at this block size.
+- 32^2 blocks: the fills, the potential top and the atmosphere ~10% cheaper,
+  the step about the same as 16^2 within the noise.
+
 Next: a hydro CZ run to a convective steady state
 (the deep CZ's thermal adjustment to the box flux), then the atmosphere and
 field; a vertical-view synthetic image.
