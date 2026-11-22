@@ -8,8 +8,11 @@ module cz3d_transport_mod
   !     1..n_act (the last opaque cell, at most n_r), the Eddington top
   !     condition with optical depth grey_tau_above above cell n_act (CZTR's
   !     grey_top_at_join), heating Q per cell;
-  !   - the bottom face carries L_bottom, split between radiation and
-  !     convection as their targets.
+  !   - the bottom face carries the flux F_bottom [erg/cm^2/s per unit box
+  !     area], split between radiation and convection as their targets.
+  ! The box: volumes dr per unit horizontal area, the faces the sphere's
+  ! relative areas area_f = (r_f/R)^2 (cz3d_bg_mod): the fluxes here are
+  ! physical (spherical L(r)/(4 pi r^2) in balance), area_f F per unit box area.
   ! Each block works on its own part of the column (its radial ghosts filled
   ! first); a face between radial blocks is computed by both (the relaxing
   ! convective flux kept by each, not exchanged), the implicit grey solve
@@ -50,16 +53,16 @@ contains
     cool_c = 0.0_dp
   end subroutine transport_init
 
-  ! Cooling layer below the top face: flux F(r) = F_top exp(-(r_f(n_r) - r)/w),
-  ! F_top = L/(4 pi r_top^2), so the layer removes L (to exp(-depth/w));
-  ! per cell the conservative difference over its faces
-  subroutine set_top_cooling(L, w)
-    real(dp), intent(in) :: L, w
+  ! Cooling layer below the top face: flux F(z) = F_top exp(-(z_top - z)/w),
+  ! so the layer removes the flux F_top (to exp(-depth/w)); per cell the
+  ! conservative difference over its faces
+  subroutine set_top_cooling(F_top, w)
+    real(dp), intent(in) :: F_top, w
     real(dp) :: F(0:n_r)
     integer :: i
     top_cooling = .true.
     do i = 0, n_r
-      F(i) = L/(4.0_dp*pi*area_f(n_r))*exp(-(r_f(n_r) - r_f(i))/w)
+      F(i) = F_top/area_f(n_r)*exp(-(r_f(n_r) - r_f(i))/w)
     end do
     cool_f = F
     do i = 1, n_r
@@ -105,8 +108,8 @@ contains
   ! lnrho, lnT, lnP, lncp: the logarithms of rho, T, P, cp (from the equation
   ! of state; the face values are interpolated in them)
   subroutine transport_column(dt, rho, T, P, cp, cv, Q, lnrho, lnT, lnP, lncp, v, s1, q_conv, f_mlt, alpha, cfl, &
-      L_bottom, tau_above, use_rad, use_conv, use_hyp, first, q_rad, Qrad, top_wall_face, tsc)
-    real(dp), intent(in) :: dt, alpha, cfl, L_bottom, tau_above
+      F_bottom, tau_above, use_rad, use_conv, use_hyp, first, q_rad, Qrad, top_wall_face, tsc)
+    real(dp), intent(in) :: dt, alpha, cfl, F_bottom, tau_above
     real(dp), intent(in) :: rho(-1:), T(-1:), P(-1:), cp(-1:), cv(-1:), Q(-1:), v(-1:), f_mlt(0:)
     real(dp), intent(in) :: lnrho(-1:), lnT(-1:), lnP(-1:), lncp(-1:)
     real(dp), intent(inout) :: s1(-1:), q_conv(0:)
@@ -171,8 +174,9 @@ contains
 
     if (top_wall_face .and. col_top) q_conv(n_c) = 0.0_dp
 
-    ! bottom face: L_bottom split as the radiative (diffusion) and convective targets
-    F_bot = L_bottom/(4.0_dp*pi*area_f(0))
+    ! bottom face: F_bottom (per unit box area) split as the radiative
+    ! (diffusion) and convective targets, as a physical flux at the face
+    F_bot = F_bottom/area_f(0)
     kap = kappa_ln(lnrho_f(0), lnT_f(0))
     Fr_t0 = -4.0_dp*a_rad*c_light*T_f(0)**3/(3.0_dp*kap*rho_f(0))*dTdr(0)
     if (.not. use_rad) Fr_t0 = 0.0_dp

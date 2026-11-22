@@ -1,11 +1,11 @@
 module cztr3d_atm_mod
   ! The atmosphere physics of CZTR (cztr_physics_mod's atm_step and
   ! cztr_advance_mod's floors), ported from CZTR_2D's cztr2d_atm_mod to the
-  ! 3D Yin-Yang shell with radial blocks and multirate (use_atmosphere, see
+  ! Cartesian box (CZTR_box; vertical blocks, multirate) (use_atmosphere, see
   ! cz3d_params_mod):
   !   - hyperbolic Spitzer conduction (HYDRAD's H I term above, Rempel
-  !     saturation 1/(1 + |F|/(1.5 rho c_s^3))) at the faces in r, theta and
-  !     phi, times the switch S at the face; each face flux relaxes to its
+  !     saturation 1/(1 + |F|/(1.5 rho c_s^3))) at the faces in z, x and
+  !     y, times the switch S at the face; each face flux relaxes to its
   !     target in tau = max(D/budget^2, 4 dt), budget = f_cfl_cond dx/dt - |v|,
   !     as CZTR. The relaxing fluxes are kept per block (qr_B, qt_B, qp_B); a
   !     face shared by two blocks has a copy in each, computed from the same
@@ -47,7 +47,7 @@ module cztr3d_atm_mod
   real(dp), allocatable, public :: Qloss_B(:,:,:,:), Qheat_B(:,:,:,:)   ! the last step's losses and heating [erg/cm3/s] (box output)
   ! the floors' action (atm_floors), summed over calls, per global radial cell:
   ! (1, i) cells checked, (2, i) rho floored, (3, i) T floored (timers_report prints them)
-  ! (4, i) the energy the T floor added [erg] (rho T ds dV; Yin-Yang overlap cells count twice)
+  ! (4, i) the energy the T floor added [erg] (rho T ds dV)
   real(dp), allocatable, public :: floor_cnt(:,:)
   ! one-block scratch: cells 0:nb(1)+1, 0:nb(2)+1, 0:nb(3)+1 (the faces' ghost cross only)
   real(dp), allocatable :: rho_A(:,:,:), T_A(:,:,:), cv_A(:,:,:), cs_A(:,:,:), ne_A(:,:,:), p_A(:,:,:)
@@ -93,6 +93,12 @@ contains
     allocate(qr_B(0:nb(1), nb(2), nb(3), nBlockMax), qt_B(nb(1), 0:nb(2), nb(3), nBlockMax), &
         qp_B(nb(1), nb(2), 0:nb(3), nBlockMax), Qloss_B(nb(1), nb(2), nb(3), nBlockMax), Qheat_B(nb(1), nb(2), nb(3), nBlockMax))
     qr_B = 0.0_dp;  qt_B = 0.0_dp;  qp_B = 0.0_dp;  Qloss_B = 0.0_dp;  Qheat_B = 0.0_dp
+    ! the ARBOR timers on every rank (arbor_timer_report is collective: a rank
+    ! without atmosphere blocks must hold the same timers)
+    if (tm_st == 0) then
+      tm_st = arbor_timer_id('atm: states');  tm_co = arbor_timer_id('atm: conduction')
+      tm_lo = arbor_timer_id('atm: losses, heating')
+    end if
     if (allocated(rho_A)) return
     allocate(rho_A(0:nb(1)+1, 0:nb(2)+1, 0:nb(3)+1))
     allocate(T_A, cv_A, cs_A, ne_A, p_A, mold=rho_A)
@@ -150,19 +156,15 @@ contains
     logical, intent(in), optional :: losses_ready   ! Qloss_B, Qheat_B already this state's (atm_losses), states stored
     logical :: ready
     ! per block: the switch at the radial faces (sfr) and the cells (scc), the
-    ! unresolved field's dB_r^2 there (dbf, dbc), sin theta (sth_j), and each
-    ! interior cell's T gradient (gc), once instead of per face
-    real(dp) :: sfr(0:nb(1)), scc(1:nb(1)), dbf(0:nb(1)), dbc(1:nb(1)), sth_j(1:nb(2)), &
+    ! unresolved field's dB_z^2 there (dbf, dbc), and each interior cell's T
+    ! gradient (gc), once instead of per face (the box: x, y distances plain)
+    real(dp) :: sfr(0:nb(1)), scc(1:nb(1)), dbf(0:nb(1)), dbc(1:nb(1)), &
         gc(3, nb(1), nb(2), nb(3))
-    real(dp) :: Tf, rf, Tg, csf, cvf, dxf, vf, x, dQ, Sc, Sf, sth, dt, fS, qcl, gt(3), bf(3), aniso
+    real(dp) :: Tf, rf, Tg, csf, cvf, dxf, vf, x, dQ, Sc, Sf, dt, fS, qcl, gt(3), bf(3), aniso
     real(dp) :: colH(nb(1)), dr, qd, ionH, lT, w, nHt, QH, iH, QCa, iCa, QMg, iMg, chromo, coron, Qheat, Qlos, colm
     integer :: i, j, k, m
     m = nb(1)
     if (maxval(atm_switch(z_c(1:m))) < 1.0e-8_dp .and. atm_switch(r_f(m) - r_top_cz) < 1.0e-8_dp) return  ! (deep CZ block)
-    if (tm_st == 0) then
-      tm_st = arbor_timer_id('atm: states');  tm_co = arbor_timer_id('atm: conduction')
-      tm_lo = arbor_timer_id('atm: losses, heating')
-    end if
     call arbor_timer_start(tm_st)
     ready = .false.
     if (present(losses_ready)) ready = losses_ready
@@ -185,9 +187,6 @@ contains
         scc(i) = atm_switch(z_c(i))
         dbc(i) = db2_at(z_c(i))
       end do
-      do j = 1, nb(2)
-        sth_j(j) = sin(X2(j))
-      end do
       if (aniso > 0.0_dp) then
         do k = 1, nb(3)
           do j = 1, nb(2)
@@ -204,12 +203,6 @@ contains
             Sf = sfr(i)
             if (Sf < 1.0e-8_dp .or. (i == 0 .and. at_bot) .or. (i == m .and. at_top)) then
               qr_B(i, j, k, ib) = 0.0_dp
-              ! an outflow top: the top cell passes the conductive energy on
-              ! (the same F A through its top face as through the face below)
-              if (i == m .and. at_top .and. wall_top == 'outflow') then
-                qr_B(m, j, k, ib) = qr_B(m-1, j, k, ib)*(r_f(m-1)/r_f(m))**2
-                F1(m, j, k, 1) = qr_B(m, j, k, ib)
-              end if
               cycle
             end if
             dt = dt_in*min(stf(i), stf(i+1))
@@ -255,7 +248,7 @@ contains
             rf = 0.5_dp*(rho_A(i, j, k) + rho_A(i, j+1, k))
             csf = 0.5_dp*(cs_A(i, j, k) + cs_A(i, j+1, k))
             cvf = 0.5_dp*(cv_A(i, j, k) + cv_A(i, j+1, k))
-            Tg = (T_A(i, j+1, k) - T_A(i, j, k))/(r_c(i)*dxf)
+            Tg = (T_A(i, j+1, k) - T_A(i, j, k))/dxf
             if (aniso > 0.0_dp) then
               gt = 0.0_dp;  x = 0.0_dp
               if (j >= 1) then;  gt = gt + gc(:, i, j, k);  x = x + 1.0_dp;  end if
@@ -267,7 +260,7 @@ contains
             vf = 0.5_dp*abs(State_GVB(i, j, k, VT, ib) + State_GVB(i, j+1, k, VT, ib))
             fS = 1.0_dp
             if (cond_r_rsun > 0.0_dp) fS = 1.0_dp/(1.0_dp + (r_c(i)/(cond_r_rsun*Rsun_atm))**2)
-            call face_flux(Sc, Tf, rf, csf, cvf, Tg, r_c(i)*dxf, vf, qt_B(i, j, k, ib), fS, 0.0_dp)
+            call face_flux(Sc, Tf, rf, csf, cvf, Tg, dxf, vf, qt_B(i, j, k, ib), fS, 0.0_dp)
             F2(i, j, k, 1) = qt_B(i, j, k, ib)
           end do
         end do
@@ -276,7 +269,6 @@ contains
       do k = 0, nb(3)
         dxf = X3(k+1) - X3(k)
         do j = 1, nb(2)
-          sth = sth_j(j)
           do i = 1, m
             Sc = scc(i)
             if (Sc < 1.0e-8_dp) then
@@ -288,7 +280,7 @@ contains
             rf = 0.5_dp*(rho_A(i, j, k) + rho_A(i, j, k+1))
             csf = 0.5_dp*(cs_A(i, j, k) + cs_A(i, j, k+1))
             cvf = 0.5_dp*(cv_A(i, j, k) + cv_A(i, j, k+1))
-            Tg = (T_A(i, j, k+1) - T_A(i, j, k))/(r_c(i)*sth*dxf)
+            Tg = (T_A(i, j, k+1) - T_A(i, j, k))/dxf
             if (aniso > 0.0_dp) then
               gt = 0.0_dp;  x = 0.0_dp
               if (k >= 1) then;  gt = gt + gc(:, i, j, k);  x = x + 1.0_dp;  end if
@@ -300,7 +292,7 @@ contains
             vf = 0.5_dp*abs(State_GVB(i, j, k, VP, ib) + State_GVB(i, j, k+1, VP, ib))
             fS = 1.0_dp
             if (cond_r_rsun > 0.0_dp) fS = 1.0_dp/(1.0_dp + (r_c(i)/(cond_r_rsun*Rsun_atm))**2)
-            call face_flux(Sc, Tf, rf, csf, cvf, Tg, r_c(i)*sth*dxf, vf, qp_B(i, j, k, ib), fS, 0.0_dp)
+            call face_flux(Sc, Tf, rf, csf, cvf, Tg, dxf, vf, qp_B(i, j, k, ib), fS, 0.0_dp)
             F3(i, j, k, 1) = qp_B(i, j, k, ib)
           end do
         end do
@@ -336,15 +328,15 @@ contains
 
   contains
 
-    ! The (r, theta, phi) gradient of T at interior cell (i, j, k) of the block
+    ! The (z, x, y) gradient of T at interior cell (i, j, k) of the block
     ! (central differences; the ghost layers next to the interior are filled)
     function grad_cell(i, j, k) result(g)
       integer, intent(in) :: i, j, k
       real(dp) :: g(3)
       associate (Y2 => Metric_DB(2, ib)%X_I, Y3 => Metric_DB(3, ib)%X_I)
         g(1) = (T_A(i+1, j, k) - T_A(i-1, j, k))/(r_c(i+1) - r_c(i-1))
-        g(2) = (T_A(i, j+1, k) - T_A(i, j-1, k))/(r_c(i)*(Y2(j+1) - Y2(j-1)))
-        g(3) = (T_A(i, j, k+1) - T_A(i, j, k-1))/(r_c(i)*sin(Y2(j))*(Y3(k+1) - Y3(k-1)))
+        g(2) = (T_A(i, j+1, k) - T_A(i, j-1, k))/(Y2(j+1) - Y2(j-1))
+        g(3) = (T_A(i, j, k+1) - T_A(i, j, k-1))/(Y3(k+1) - Y3(k-1))
       end associate
     end function grad_cell
 

@@ -1,12 +1,18 @@
 module cz3d_app_mod
-  ! The 3D convection-zone run on ARBOR (Yin-Yang shell; a radial column in
-  ! one block or in nb_r-cell radial blocks, optionally multirate): CZTR
-  ! step 1 in 3D. Perturbations rho1, v = (v_r,
-  ! v_theta, v_phi), s1 about the fixed 1D background (rho0, s0)(r):
+  ! CZTR_box: CZTR_3D in a Cartesian box on ARBOR (periodic in x and y; a
+  ! vertical column in one block or in nb_r-cell blocks). The physics is
+  ! CZTR_3D's; the geometry is plane-parallel: z vertical (ARBOR's first
+  ! direction, the 1D grid's radius read as z + R), x and y horizontal, no
+  ! metric factors or curvature terms. The variable names keep CZTR_3D's
+  ! slots: v_r, v_theta, v_phi (vr_, vt_, vp_) hold v_z, v_x, v_y, and B_r,
+  ! B_theta, B_phi hold B_z, B_x, B_y; "radial" means vertical. Gravity g(z)
+  ! is the spherical background's (the spherical profile in z is an exact
+  ! hydrostatic state with that artificial gravity). Perturbations rho1, v,
+  ! s1 about the fixed 1D background (rho0, s0)(z):
   !
   !   drho1/dt = -div(rho v)
-  !   dv/dt    = -(v.grad) v - (grad p1 + g rho1 e_r)/rho      (with the spherical curvature terms)
-  !   ds1/dt   = -v.grad s1 - v_r ds0/dr
+  !   dv/dt    = -(v.grad) v - (grad p1 + g rho1 e_z)/rho
+  !   ds1/dt   = -v.grad s1 - v_z ds0/dz
   !
   ! The background force (dp0/dr + rho0 g) is left out: the CZ background is
   ! taken as hydrostatic (well balanced, as CZTR step 1, where it is off in
@@ -16,15 +22,14 @@ module cz3d_app_mod
   ! (switch h) in all three directions. The order and the radial operators are
   ! CZTR's: radial derivatives use CZTR's stencil and metric by radial index
   ! (cz3d_bg_mod), so a horizontally uniform state evolves as in CZTR.
-  ! Walls at the bottom and the top (wall_bottom, wall_top: 'face' or 'cell'),
-  ! the mass flux r^2 rho v_r odd about the wall.
+  ! Walls at the bottom and the top (wall_bottom, wall_top: 'face' or 'cell';
+  ! wall_top 'box': open, MURaM-like), the mass flux rho v_z odd about a wall.
   ! This file holds the module's data and the time step (the hot path); the
   ! submodules hold setup and state transfer (src/cz3d_setup_smod.f90),
   ! diagnostics (src/cz3d_diag_smod.f90) and the synthetic observables
   ! (src/cz3d_synth_smod.f90), sharing the data by host association.
   use arbor
   use cz3d_params_mod
-  use pfss_mod, only: pfss_legendre, pfss_radial
   use cz3d_bg_mod, only: k_join, n_r, n_c, bg_view, r_c, r_f, drdxi_c, rho0, s0, p0, lnp0, g_c, z_c, ds0dr, rho1_init, s1_init, &
       v_init, tab, area_f, xi, T0, ddr_c, cs0, vol_c, r_top_cz
   use cz3d_transport_mod, only: transport_column, grey_atm_column, cool_f, cool_c, grey_i0, tr_view, col_bottom, col_top
@@ -70,12 +75,11 @@ module cz3d_app_mod
   real(dp), pointer :: f_mlt_g(:,:) => null()     ! (0:n_r, level 0:max(refine_h, patch_level))
   integer :: lev_view = 0                         ! the bound block's horizontal level
   real(dp), allocatable :: rho0_w(:), rq_w(:)      ! rho0, rq of the whole column, cells -1:n_r+2 (wall ghosts)
-  real(dp), allocatable :: s0_w(:), r_w(:)         ! s0, r_c of the whole column (outflow ghosts)
+  real(dp), allocatable :: s0_w(:), r_w(:)         ! s0, r_c of the whole column (the top ghosts)
   ! import: the export files' index (import_open)
   integer, allocatable :: imp_key(:,:), imp_file(:)
   integer(i8), allocatable :: imp_pos(:)
   integer :: imp_nb(3) = 0, imp_nv = 0
-  real(dp) :: dtheta = 0.0_dp                     ! angular cell size (Yin-Yang: the same in theta and phi)
   ! rq(i): the physical density perturbation is rq rho1 (rsst_form =
   ! 'hotta2015': 1/xi^2, rho1 being the scaled xi^2 rho1; else 1). The
   ! inertia, mass and momentum fluxes use rho0 + rho1, the EOS and buoyancy
@@ -123,24 +127,22 @@ module cz3d_app_mod
   real(dp) :: wall0 = 0.0_dp
   real(dp) :: dt_last = 0.0_dp
   real(dp) :: dt_now = 0.0_dp                     ! the step being taken (the GLM speed 'cfl')
-  ! angular-momentum correction: the reference L_z (its start value plus the
-  ! Coriolis impulse since), the impulse accumulated since the last
-  ! correction, the next correction time
-  real(dp) :: lz_ref = 0.0_dp, lz_imp = 0.0_dp, t_next_lzc = 0.0_dp
-  ! synthetic EUV (euv_write): the response table (uniform log10 T rows) and the schedule
-  real(dp), allocatable :: euv_K(:,:), euv_lgT(:)
-  integer, allocatable :: euv_ch(:)
-  real(dp) :: t_next_euv = -huge(1.0_dp)
-  ! synthetic continuum (phot_write): the wavelengths [A], their channel and weight, the channel ids
-  real(dp), allocatable :: ph_lam(:), ph_wgt(:)
-  integer, allocatable :: ph_chn(:), ph_id(:)
-  logical :: lz_ref_set = .false.
+  ! the bottom face's energy flux [erg/cm^2/s] (cz_setup: L_bottom_Lsun L_sun/(4 pi R^2))
+  real(dp), public :: F_bottom = 0.0_dp
+  ! the box's potential fields (cz3d_setup_smod): the DFT phase tables of the
+  ! map at level refine_h, pf_ex(mx, i) = exp(i kx_mx x_i), pf_ey, the modes'
+  ! wave numbers; b_bc_top = 'potential': the top ghosts' B per block
+  ! (ghost layer, j, k, component), set once per step (btop_ready)
+  complex(dp), allocatable :: pf_ex(:,:), pf_ey(:,:)
+  real(dp), allocatable :: pf_kx(:), pf_ky(:), btop_GB(:,:,:,:,:)
+  logical :: btop_ready = .false.
   ! wall-clock timers per stage of a step (tic/toc; timers_report at the end of the run)
   integer, parameter :: T_ADV = 1, T_GHOST = 2, T_RHS = 3, T_SI = 4, T_TRANS = 5, T_ATM = 6, T_DIFF = 7, T_DT = 8, &
       T_AFTER = 9, T_D_ETA = 10, T_D_EOS = 11, T_D_FA = 12, T_D_FB = 13, T_D_FR = 14, T_D_FE = 15, T_D_DIV = 16, &
       T_D_UPD = 17, T_D_IMP = 18, T_D_PRE = 19, T_D_SIP = 20, T_R_EOS = 21, T_R_MASS = 22, T_R_ADV = 23, &
       T_R_PRS = 24, T_R_MCURL = 25, T_R_MLOOP = 26, T_R_UPD = 27, T_R_SIC = 28, T_G_RK = 29, T_G_ATM = 30, &
-      T_G_DIF = 31, T_G_JOIN = 32, T_G_TR = 33, T_G_ETA = 34, T_R_OVL = 35, T_A_OVL = 36, T_S_SOL = 37, n_tim = 37
+      T_G_DIF = 31, T_G_JOIN = 32, T_G_TR = 33, T_G_ETA = 34, T_R_OVL = 35, T_A_OVL = 36, T_S_SOL = 37, T_TOPB = 38, &
+      n_tim = 38
   character(len=24), parameter :: tim_name(n_tim) = [character(len=24) :: 'advance (total)', &
       '  ghost fill + join', '  rhs + RK update', '  radial implicit solves', '  energy transport', &
       '  atmosphere', '  diffusion', 'stable_dt (local)', 'after_step (outputs)', &
@@ -150,7 +152,7 @@ module cz3d_app_mod
       '    EOS (derived, p1)', '    mass flux div', '    advection (4 vars)', '    pressure, curvature', &
       '    MHD: curls, div B', '    MHD: Lorentz, psi', '    RK update', '    si_coeff', &
       '    fill: 4 RK stages', '    fill: atmosphere', '    fill: diffusion', '    join_bc (all)', &
-      '    fill: transport', '    fill: eta', '    during the fill: EOS', '    during the fill: losses', '    the column solves']
+      '    fill: transport', '    fill: eta', '    during the fill: EOS', '    during the fill: losses', '    the column solves', '  potential top (B)']
   real(dp) :: tim_acc(n_tim) = 0.0_dp, tim_t0(n_tim) = 0.0_dp
   ! the dt report (cz_log): per constraint (1 CFL sum, 2 wave cap, 3 losses)
   ! this step's smallest dt on this rank and its cell: (c, 1) dt, 2 global
@@ -162,9 +164,8 @@ module cz3d_app_mod
   real(dp) :: eta_cap_n(2) = 0.0_dp      ! b_eta_radial = 'explicit': cells capped, cells (summed over steps)
 
   ! ---- energy budget per radial shell (dt_budget > 0) ----
-  ! E = rho e + rho v^2/2 + rho Phi summed over each shell (cells in the
-  ! Yin-Yang overlap weighted 1/2, margin cells 0: an integral over the
-  ! sphere). Per operator, its energy change accumulated since the run's
+  ! E = rho e + rho v^2/2 + rho Phi summed over each layer (an integral over
+  ! the box). Per operator, its energy change accumulated since the run's
   ! start, to first order per step: d(rho e) = rho T ds + h d rho (T, h of
   ! the state before the operator; h = h0(r) + T s1 + p1/rho, h0 from the EOS
   ! core), the kinetic change exactly, Phi d rho:
@@ -186,9 +187,9 @@ module cz3d_app_mod
   ! the bound block lies above the join (use_atmosphere; the join is a radial
   ! block face, so a block is all CZ or all atmosphere): CZ-only work skipped
   logical :: in_atm = .false.
-  ! per bound block (cz_bind): atm_switch(z) of its radial cells and sin theta
-  ! of its theta cells, ghosts included (cell_cap's ingredients, once per bind)
-  real(dp), allocatable :: sw_r(:), sn_t(:)
+  ! per bound block (cz_bind): atm_switch(z) of its vertical cells, ghosts
+  ! included (cell_cap's ingredient, once per bind)
+  real(dp), allocatable :: sw_r(:)
   ! the radial size in the Alfven cap's dx_min (cz_bind): drdxi_c, or huge
   ! where va_cap_horizontal leaves it out (the semi-implicit radial range)
   real(dp), allocatable :: drc_r(:)
@@ -227,14 +228,14 @@ module cz3d_app_mod
   integer, parameter :: nAcc = 18
   real(dp), allocatable :: bgf_r(:)
 
-  public :: timers_report, euv_write, cz_smooth_b, cz_columns_to_ranks, cz_import_cz, cz_match_base, cz_seed_pfss, max_mach_report, cz_n_var, cz_field_from_hydro, export_state_write, import_open, import_max_level, import_criterion, import_meta, cz_setup, cz_transport_all, cz_log, cz_profile, wall_bc, state_checksum, budget_start, dump_shells_write
+  public :: timers_report, cz_smooth_b, cz_columns_to_ranks, cz_import_cz, cz_match_base, cz_seed_potential, max_mach_report, cz_n_var, cz_field_from_hydro, export_state_write, import_open, import_max_level, import_criterion, import_meta, cz_setup, cz_transport_all, cz_log, cz_profile, wall_bc, state_checksum, budget_start, dump_shells_write
 
   ! The routines in the submodules (src/cz3d_setup_smod.f90, cz3d_diag_smod.f90,
   ! cz3d_synth_smod.f90) called from outside their submodule: their interfaces
   ! the parent's routines the submodules call: public, so the compiler keeps
   ! their symbols (a private procedure inlined at all its calls in the parent
   ! is dropped, and the submodules' references fail to link)
-  public :: tic, toc, cz_bind, cz_unbind, si_in, ddr_block, curl_block, div_block, lorentz_f, cell_cap, yy_core, angular_momentum
+  public :: tic, toc, cz_bind, cz_unbind, si_in, ddr_block, curl_block, div_block, lorentz_f, cell_cap
 
   interface
     ! --- cz3d_setup_smod
@@ -253,8 +254,10 @@ module cz3d_app_mod
     end subroutine cz_init_block
     module subroutine cz_field_from_hydro()
     end subroutine cz_field_from_hydro
-    module subroutine cz_seed_pfss()
-    end subroutine cz_seed_pfss
+    module subroutine cz_seed_potential()
+    end subroutine cz_seed_potential
+    module subroutine cz_top_potential()
+    end subroutine cz_top_potential
     module subroutine export_state_write(t, iStep)
       real(dp), intent(in) :: t
       integer, intent(in) :: iStep
@@ -330,11 +333,6 @@ module cz3d_app_mod
       real(dp), intent(in) :: wall
       integer, intent(in) :: n_step
     end subroutine timers_report
-    ! --- cz3d_synth_smod
-    module subroutine euv_write(iStep, t)
-      integer, intent(in) :: iStep
-      real(dp), intent(in) :: t
-    end subroutine euv_write
   end interface
 
 contains
@@ -355,7 +353,7 @@ contains
     col_top = at_top
     if (use_atmosphere) col_top = Key_IB(KI+1, ib)*nb(1) + nb(1) == k_join   ! (grey and MLT end at the join)
     in_atm = use_atmosphere .and. Key_IB(KI+1, ib)*nb(1) >= k_join
-    if (.not. allocated(sw_r)) allocate(sw_r(1-ng:nb(1)+ng), sn_t(1-ng:nb(2)+ng), drc_r(1-ng:nb(1)+ng))
+    if (.not. allocated(sw_r)) allocate(sw_r(1-ng:nb(1)+ng), drc_r(1-ng:nb(1)+ng))
     drc_r = drdxi_c(1-ng:nb(1)+ng)
     if (va_cap_horizontal .and. si_radial .and. si_i1 > 0) then
       do i = 1 - ng, nb(1) + ng
@@ -364,7 +362,6 @@ contains
     end if
     sw_r = 0.0_dp
     if (use_atmosphere) sw_r = atm_switch(z_c(1-ng:nb(1)+ng))
-    sn_t = sin(Metric_DB(2, ib)%X_I(1-ng:nb(2)+ng))
     join_wall_lo = freeze_cz_mode == 'ghost' .and. freeze_side == 'cz' .and. Key_IB(KI+1, ib)*nb(1) == k_join
     join_wall_hi = freeze_cz_mode == 'ghost' .and. freeze_side == 'atmosphere' .and. Key_IB(KI+1, ib)*nb(1) + nb(1) == k_join
   end subroutine cz_bind
@@ -460,8 +457,8 @@ contains
 
   ! ================================================================ boundaries
 
-  ! Walls in r: v_r odd, everything else even; 'cell': v_r = 0 in the
-  ! boundary cell. (theta, phi: Yin-Yang patch edges, filled by ARBOR.)
+  ! Walls in z: v_z odd, everything else even; 'cell': v_z = 0 in the
+  ! boundary cell; the top 'box': open (box_top). (x, y: periodic, ARBOR.)
   subroutine wall_bc(A, iVarMin, iVarMax, iBlock, iDir, iSide, nGhost)
     real(dp), intent(inout) :: A(1-ng:, 1-ng:, 1-ng:, :, :)
     integer, intent(in) :: iVarMin, iVarMax, iBlock, iDir, iSide, nGhost
@@ -470,8 +467,8 @@ contains
     character(len=12) :: bc
     logical :: odd
     wt = merge(wall_bottom, wall_top, iSide == 1)
-    if (iDir == 1 .and. iSide == 2 .and. wt == 'outflow') then
-      call outflow_top(Key_IB(KI+1, iBlock)*nb(1))
+    if (iDir == 1 .and. iSide == 2 .and. wt == 'box') then
+      call box_top(Key_IB(KI+1, iBlock)*nb(1))
       return
     end if
     wall = merge(WALL_FACE, WALL_CELL, wt == 'face')
@@ -493,32 +490,45 @@ contains
       if (v == rho1_ .and. iDir == 1 .and. allocated(rho0_w)) call relative_rho1(Key_IB(KI+1, iBlock)*nb(1))
     end do
   contains
-    ! wall_top = 'outflow': rho ~ r^-2, v_r >= 0 copied, v_h and s copied;
-    ! B_r ~ r^-2, B_h and psi copied
-    subroutine outflow_top(off)
+    ! wall_top = 'box' (MURaM-like): v_z box_top_vz(g) times the top cell's,
+    ! v_x, v_y and s1 copied, rho/rho0 copied (the ghosts follow the
+    ! background's hydrostatic stratification); B: the potential field of the
+    ! top layer's B_z (b_bc_top 'potential', btop_GB, once set; copied before),
+    ! copied ('open') or mirrored about the top face ('radial': B_x, B_y odd;
+    ! 'conductor': B_z odd); psi copied ('potential', 'open')
+    subroutine box_top(off)
       integer, intent(in) :: off
       integer :: g, m, dst, v
-      real(dp) :: q2
       m = nb(1)
-      do g = 1, nGhost
-        dst = m + g
-        q2 = (r_w(off+m)/r_w(off+dst))**2
-        do v = iVarMin, min(iVarMax, nv)
+      do v = iVarMin, min(iVarMax, nv)
+        if (v >= br_ .and. v <= bp_ .and. b_bc_top == 'potential' .and. btop_ready) then
+          do g = 1, nGhost
+            A(m+g, 1:nb(2), 1:nb(3), v, iBlock) = btop_GB(g, :, :, v - br_ + 1, iBlock)
+            A(m+g, 1-ng:0, :, v, iBlock) = A(m, 1-ng:0, :, v, iBlock)              ! (edge ghosts: copied)
+            A(m+g, nb(2)+1:, :, v, iBlock) = A(m, nb(2)+1:, :, v, iBlock)
+            A(m+g, 1:nb(2), 1-ng:0, v, iBlock) = A(m, 1:nb(2), 1-ng:0, v, iBlock)
+            A(m+g, 1:nb(2), nb(3)+1:, v, iBlock) = A(m, 1:nb(2), nb(3)+1:, v, iBlock)
+          end do
+          cycle
+        end if
+        if (v > s1_ .and. b_bc_top /= 'open' .and. b_bc_top /= 'potential') then
+          odd = (v == br_ .and. b_bc_top == 'conductor') .or. ((v == bt_ .or. v == bp_) .and. b_bc_top == 'radial')
+          call arbor_bc_mirror(A, v, v, iBlock, iDir, iSide, nGhost, merge(-1, 1, odd), WALL_FACE)
+          cycle
+        end if
+        do g = 1, nGhost
+          dst = m + g
           if (v == rho1_) then
-            A(dst, :, :, v, iBlock) = ((rho0_w(off+m) + rq_w(off+m)*A(m, :, :, v, iBlock))*q2 - rho0_w(off+dst)) &
-                /rq_w(off+dst)
+            A(dst, :, :, v, iBlock) = (rho0_w(off+dst)*(rho0_w(off+m) + rq_w(off+m)*A(m, :, :, v, iBlock))/rho0_w(off+m) &
+                - rho0_w(off+dst))/rq_w(off+dst)
           else if (v == vr_) then
-            A(dst, :, :, v, iBlock) = max(A(m, :, :, v, iBlock), 0.0_dp)
-          else if (v == s1_) then
-            A(dst, :, :, v, iBlock) = A(m, :, :, v, iBlock) + s0_w(off+m) - s0_w(off+dst)
-          else if (use_B .and. v == br_) then
-            A(dst, :, :, v, iBlock) = A(m, :, :, v, iBlock)*q2
+            A(dst, :, :, v, iBlock) = box_top_vz(min(g, 2))*A(m, :, :, v, iBlock)
           else
             A(dst, :, :, v, iBlock) = A(m, :, :, v, iBlock)
           end if
         end do
       end do
-    end subroutine outflow_top
+    end subroutine box_top
 
     subroutine relative_rho1(off)
       integer, intent(in) :: off
@@ -537,8 +547,8 @@ contains
     end subroutine relative_rho1
   end subroutine wall_bc
 
-  ! The radial mass flux W = r^2 rho v_r odd about both walls (mirroring
-  ! rho1 and v_r alone would leak: r^2 rho0 differs across the wall)
+  ! The vertical mass flux W = rho v_z odd about both walls (mirroring
+  ! rho1 and v_z alone would leak: rho0 differs across the wall)
   subroutine odd_wall_flux(W)
     real(dp), intent(inout) :: W(1-ng:, 1-ng:, 1-ng:)
     integer :: m
@@ -556,7 +566,7 @@ contains
     if (join_wall_hi) then
       W(m+1, :, :) = -W(m, :, :);  W(m+2, :, :) = -W(m-1, :, :)
     end if
-    if (at_top .and. wall_top /= 'outflow') then
+    if (at_top .and. wall_top /= 'box') then
       if (wall_top == 'face') then
         W(m+1, :, :) = -W(m, :, :);  W(m+2, :, :) = -W(m-1, :, :)
       else
@@ -665,8 +675,8 @@ contains
 !DIR$ IVDEP
           do i = i0, i1
             cs_G(i, j, k) = cs_G(i, j, k) + va_cap(sum(State_GVB(i, j, k, br_:bp_, ib)**2), rp(i), cs_G(i, j, k), &
-                norm2(State_GVB(i, j, k, vr_:vp_, ib)), min(drc_r(i), r_c(i)*Metric_DB(2, ib)%Dx_I(j), &
-                r_c(i)*sn_t(j)*Metric_DB(3, ib)%Dx_I(k)), sw_r(i))
+                norm2(State_GVB(i, j, k, vr_:vp_, ib)), min(drc_r(i), Metric_DB(2, ib)%Dx_I(j), &
+                Metric_DB(3, ib)%Dx_I(k)), sw_r(i))
           end do
         end if
       end if
@@ -729,14 +739,14 @@ contains
           ! (cell_cs, cell_cap, va_eff through va_cap: the same arithmetic)
           siSa_B(i, j, k, ib) = max(0.0_dp, (va_cap(State_GVB(i, j, k, br_, ib)**2, rp, &
               sqrt(5.0_dp/3.0_dp*max(p0(i) + p1_G(i, j, k), 1.0e-30_dp)/rp)/xi(i), &
-              norm2(State_GVB(i, j, k, vr_:vp_, ib)), min(drc_r(i), r_c(i)*Metric_DB(2, ib)%Dx_I(j), &
-              r_c(i)*sn_t(j)*Metric_DB(3, ib)%Dx_I(k)), sw_r(i))*dt/(si_cfl - cf))**2 - 0.25_dp*dr**2)
+              norm2(State_GVB(i, j, k, vr_:vp_, ib)), min(drc_r(i), Metric_DB(2, ib)%Dx_I(j), &
+              Metric_DB(3, ib)%Dx_I(k)), sw_r(i))*dt/(si_cfl - cf))**2 - 0.25_dp*dr**2)
         end do
       end do
     end do
   end subroutine si_coeff
 
-  ! X <- x with (rho - (1/r^2) d/dr r^2 rho S d/dr) x = rho X along every
+  ! X <- x with (rho - d/dz rho S d/dz) x = rho X along every
   ! local column's range (conservative 3-point form on the cell widths; face
   ! S and rho the means of the two cells; no flux through the range's end
   ! faces). X(i, j, k, ib) on the blocks of the range, S = SS (siS_B, or
@@ -785,11 +795,11 @@ contains
       wf(:, 0) = 0.0_dp;  wf(:, m) = 0.0_dp
       do n = 1, m - 1
         g = si_i0 - 1 + n
-        wf(:, n) = r_f(g)**2*0.25_dp*(rp(:, n) + rp(:, n+1))*(sv(:, n) + sv(:, n+1))/(r_c(g+1) - r_c(g))
+        wf(:, n) = 0.25_dp*(rp(:, n) + rp(:, n+1))*(sv(:, n) + sv(:, n+1))/(r_c(g+1) - r_c(g))
       end do
       do n = 1, m
         g = si_i0 - 1 + n
-        vol = r_c(g)**2*(r_f(g) - r_f(g-1))
+        vol = r_f(g) - r_f(g-1)
         a(:, n) = -wf(:, n-1)
         cc(:, n) = -wf(:, n)
         b(:, n) = vol*rp(:, n) + wf(:, n-1) + wf(:, n)
@@ -849,7 +859,7 @@ contains
         cycle
       end if
       call derived(ib, D_CS, C_ALL)
-      associate (th => Metric_DB(2, ib)%X_I, dth_ => Metric_DB(2, ib)%Dx_I, dph_ => Metric_DB(3, ib)%Dx_I)
+      associate (dth_ => Metric_DB(2, ib)%Dx_I, dph_ => Metric_DB(3, ib)%Dx_I)
       do k = 1, nb(3)
         do j = 1, nb(2)
           do i = 1, nb(1)
@@ -871,7 +881,7 @@ contains
                 end do
               end do
             end do
-            dh = r_c(i)*min(dth_(j), sin(th(j))*dph_(k))
+            dh = min(dth_(j), dph_(k))
             EtaB_GB(i, j, k, 1, ib) = b_diff_factor*phi*0.5_dp*(sqrt(sum(State_GVB(i, j, k, vr_:vp_, ib)**2)) &
                 + cs_G(i, j, k))*dh
           end do
@@ -884,12 +894,12 @@ contains
       do jb = 1, size(iBlocks)
         ib = iBlocks(jb)
         call cz_bind(ib)
-        associate (th => Metric_DB(2, ib)%X_I, dth_ => Metric_DB(2, ib)%Dx_I, dph_ => Metric_DB(3, ib)%Dx_I)
+        associate (dth_ => Metric_DB(2, ib)%Dx_I, dph_ => Metric_DB(3, ib)%Dx_I)
         do k = 1, nb(3)
           do j = 1, nb(2)
             do i = 1, nb(1)
               w = 0.4_dp/(tsc(i)*dt_now*(1.0_dp/min(r_c(i+1) - r_c(i), r_c(i) - r_c(i-1))**2 &
-                  + 1.0_dp/(r_c(i)*dth_(j))**2 + 1.0_dp/(r_c(i)*sin(th(j))*dph_(k))**2))
+                  + 1.0_dp/dth_(j)**2 + 1.0_dp/dph_(k)**2))
               eta_cap_n(2) = eta_cap_n(2) + 1.0_dp
               if (EtaB_GB(i, j, k, 1, ib) > w) then
                 EtaB_GB(i, j, k, 1, ib) = w
@@ -912,11 +922,11 @@ contains
     end do
   end subroutine b_eta_fill
 
-  ! b_diff_form = 'resistive': the radial normal term of B_theta and B_phi
+  ! b_diff_form = 'resistive': the vertical normal term of B_x and B_y
   ! implicit, along every local column (the whole column):
-  !   x - x* = tsc dt (1/V) [A_+ eta_+ (r_+ x_+ - r x)/(r_f dr_+) - A_- eta_- (r x - r_- x_-)/(r_f dr_-)]
-  ! (the radial flux -eta (r_+ x_+ - r x)/(r_f dr) of the explicit form, A =
-  ! r_f^2, V = the cell's volume per steradian); at the column's end faces the ghost value is
+  !   x - x* = tsc dt (1/V) [eta_+ (x_+ - x)/dz_+ - eta_- (x - x_-)/dz_-]
+  ! (the vertical flux -eta (x_+ - x)/dz of the explicit form, V = dz per
+  ! unit horizontal area); at the column's end faces the ghost value is
   ! explicit (the fill before the diffusion). x* the state after the
   ! explicit fluxes. With diffusion_heating the field energy removed from a
   ! cell goes into its s1 (with the atmosphere: the CZ cells, up to k_join).
@@ -925,7 +935,7 @@ contains
     real(dp), intent(in) :: dt
     integer :: c, q, i, j, k, m, nk, n, g, ib, v, jb
     real(dp), allocatable :: a(:), b(:), cc(:), d(:), et(:), kf(:), xg(:), de(:,:,:,:)
-    real(dp) :: vol, w, rf, rpw(nb(1)), sw(nb(1)), ltw(nb(1)), tw(nb(1))
+    real(dp) :: vol, w, rpw(nb(1)), sw(nb(1)), ltw(nb(1)), tw(nb(1))
     logical :: heat
     nk = n_r/nb(1)
     m = n_r
@@ -948,10 +958,9 @@ contains
           et(0) = EtaB_GB(0, j, k, 1, si_cb(1, c))
           et(m+1) = EtaB_GB(nb(1)+1, j, k, 1, si_cb(nk, c))
           if (maxval(et) <= 0.0_dp) cycle
-          ! kf(n): A eta/(r_f dr) of the face above cell n (0: the bottom face)
+          ! kf(n): eta/dz of the face above cell n (0: the bottom face)
           do n = 0, m
-            rf = 0.5_dp*(r_c(n) + r_c(n+1))
-            kf(n) = r_f(n)**2*0.5_dp*(et(n) + et(n+1))/(rf*(r_c(n+1) - r_c(n)))
+            kf(n) = 0.5_dp*(et(n) + et(n+1))/(r_c(n+1) - r_c(n))
           end do
           do v = bt_, bp_
             do q = 1, nk
@@ -964,9 +973,9 @@ contains
             xg(2) = State_GVB(nb(1)+1, j, k, v, si_cb(nk, c))
             do n = 1, m
               vol = vol_c(n)/(tsc_g(n)*dt)
-              a(n) = -kf(n-1)*r_c(n-1)
-              cc(n) = -kf(n)*r_c(n+1)
-              b(n) = vol + (kf(n-1) + kf(n))*r_c(n)
+              a(n) = -kf(n-1)
+              cc(n) = -kf(n)
+              b(n) = vol + kf(n-1) + kf(n)
               if (heat .and. (n <= k_join .or. .not. use_atmosphere)) then
                 ib = si_cb((n - 1)/nb(1) + 1, c)
                 de(n - ((n - 1)/nb(1))*nb(1), j, k, ib) = de(n - ((n - 1)/nb(1))*nb(1), j, k, ib) - d(n)**2
@@ -1025,11 +1034,11 @@ contains
 
   ! ================================================================ time step
 
-  ! dt < cfl / sum_d (|v_d| + cs/xi)/l_d, l_r = CZTR's dr/dxi
+  ! dt < cfl / sum_d (|v_d| + cs/xi)/l_d, l_z = CZTR's dr/dxi, l_x = dx, l_y = dy
   real(dp) function cz_stable_dt(self, iBlock) result(dt)
     class(cz3d_app_t), intent(inout) :: self
     integer, intent(in) :: iBlock
-    real(dp) :: cs, cs0, crad, ratew, rate, rr, sth, rc, rp(nb(1)), s(nb(1)), q(nb(1), 2), e(nb(1))
+    real(dp) :: cs, cs0, crad, ratew, rate, rc, rp(nb(1)), s(nb(1)), q(nb(1), 2), e(nb(1)), dxj, dyk
     real(dp) :: cs0v(nb(1)), csv(nb(1)), cradv(nb(1)), rcv(nb(1)), insi(nb(1)), dxm, vm, crb
     integer :: i, j, k
     call tic(T_DT)
@@ -1041,8 +1050,9 @@ contains
       if (si_radial .and. r_off + i >= si_i0 + 2 .and. r_off + i <= si_i1 - 2) insi(i) = 1.0_dp
     end do
     do k = 1, nb(3)
+      dyk = Metric_DB(3, iBlock)%Dx_I(k)
       do j = 1, nb(2)
-        sth = sn_t(j)
+        dxj = Metric_DB(2, iBlock)%Dx_I(j)
         do i = 1, nb(1)
           rp(i) = rho0(i) + rq(i)*State_GVB(i, j, k, rho1_, iBlock)
           s(i) = s0(i) + State_GVB(i, j, k, s1_, iBlock)
@@ -1061,7 +1071,7 @@ contains
           cs0v(i) = sqrt(q(i, 2)*e(i)/rp(i))/xi(i)
           csv(i) = cs0v(i)
           if (use_B) then
-            dxm = min(drc_r(i), r_c(i)*Metric_DB(2, iBlock)%Dx_I(j), r_c(i)*sn_t(j)*Metric_DB(3, iBlock)%Dx_I(k))
+            dxm = min(drc_r(i), dxj, dyk)
             vm = norm2(State_GVB(i, j, k, vr_:vp_, iBlock))
             csv(i) = cs0v(i) + va_cap(sum(State_GVB(i, j, k, br_:bp_, iBlock)**2), rp(i), cs0v(i), vm, dxm, sw_r(i))
             crb = 0.0_dp
@@ -1070,21 +1080,20 @@ contains
           else
             cradv(i) = merge(0.0_dp, csv(i), insi(i) > 0.0_dp)
           end if
-          rr = r_c(i)
           rcv(i) = (abs(State_GVB(i, j, k, vr_, iBlock)) + cradv(i))/drdxi_c(i) &
-              + (abs(State_GVB(i, j, k, vt_, iBlock)) + csv(i))/(rr*Metric_DB(2, iBlock)%Dx_I(j)) &
-              + (abs(State_GVB(i, j, k, vp_, iBlock)) + csv(i))/(rr*sth*Metric_DB(3, iBlock)%Dx_I(k))
+              + (abs(State_GVB(i, j, k, vt_, iBlock)) + csv(i))/dxj &
+              + (abs(State_GVB(i, j, k, vp_, iBlock)) + csv(i))/dyk
         end do
         ! the maxima and the dt report's minima
         do i = 1, nb(1)
-          cs = csv(i);  cs0 = cs0v(i);  crad = cradv(i);  rc = rcv(i);  rr = r_c(i)
+          cs = csv(i);  cs0 = cs0v(i);  crad = cradv(i);  rc = rcv(i)
           if (insi(i) > 0.0_dp .and. wave_cfl_max > 0.0_dp) ratew = max(ratew, merge(cs0, cs, wave_cfl_cs_only)/drdxi_c(i))
           if (cfl/rc < dtl(1, 1)) then
             block
               real(dp) :: t3(3)
               t3 = [(abs(State_GVB(i, j, k, vr_, iBlock)) + crad)/drdxi_c(i), &
-                  (abs(State_GVB(i, j, k, vt_, iBlock)) + cs)/(rr*Metric_DB(2, iBlock)%Dx_I(j)), &
-                  (abs(State_GVB(i, j, k, vp_, iBlock)) + cs)/(rr*sth*Metric_DB(3, iBlock)%Dx_I(k))]
+                  (abs(State_GVB(i, j, k, vt_, iBlock)) + cs)/dxj, &
+                  (abs(State_GVB(i, j, k, vp_, iBlock)) + cs)/dyk]
               dtl(1, :) = [cfl/rc, real(r_off + i, dp), z_c(i)/1.0e5_dp, abs(State_GVB(i, j, k, vr_, iBlock)), crad, cs, &
                   real(maxloc(t3, 1), dp), drdxi_c(i)/1.0e5_dp]
             end block
@@ -1128,6 +1137,13 @@ contains
     dt_run = dt_run + dt
     call local_steps(dt)
     dt_now = dt
+    ! the potential-field top: the top ghosts' B from this step's top layer
+    ! (collective; the stages' fills use it)
+    if (use_B .and. wall_top == 'box' .and. b_bc_top == 'potential') then
+      call tic(T_TOPB)
+      call cz_top_potential()
+      call toc(T_TOPB)
+    end if
     if (test_freeze_b .and. use_B .and. .not. allocated(fzb_B)) then
       allocate(fzb_B(nb(1), nb(2), nb(3), br_:psi_, size(State_GVB, 5)))
       do jb = 1, size(iBlocks)
@@ -1160,15 +1176,6 @@ contains
         end if
         frz_B(:, :, :, :, ib) = State_GVB(1:nb(1), 1:nb(2), 1:nb(3), 1:nv, ib)
         frz_have(ib) = .true.
-      end do
-      call cz_unbind()
-    end if
-    if (lz_correct_steps > 0 .or. lz_correct_dt > 0.0_dp) call lz_impulse(dt)
-    ! Coriolis split: half a rotation first (also of StateOld, the RK stages' base)
-    if (omega_rot /= 0.0_dp .and. coriolis == 'split') then
-      do jb = 1, size(iBlocks)
-        call cz_bind(iBlocks(jb))
-        call coriolis_rotate(iBlocks(jb), 0.5_dp*dt, .true.)
       end do
       call cz_unbind()
     end if
@@ -1489,14 +1496,6 @@ contains
       end if
     end do
     call cz_unbind()
-    ! ... and the second half after the step
-    if (omega_rot /= 0.0_dp .and. coriolis == 'split') then
-      do jb = 1, size(iBlocks)
-        call cz_bind(iBlocks(jb))
-        call coriolis_rotate(iBlocks(jb), 0.5_dp*dt, .false.)
-      end do
-      call cz_unbind()
-    end if
     ! ghost mode: the frozen side's blocks exactly as stored
     if (freeze_side /= 'none' .and. freeze_cz_mode == 'ghost') then
       do jb = 1, size(iBlocks)
@@ -1594,193 +1593,118 @@ contains
     end do
   end subroutine ddr_block
 
-  ! Right-hand side R_CV of block ib (ghost cells filled)
+  ! Right-hand side R_CV of block ib (ghost cells filled): Cartesian, z with
+  ! CZTR's stencil and metric (ddr_block), x and y with ARBOR's (arbor_deriv_cell)
   subroutine rhs(ib)
     integer, intent(in) :: ib
     integer :: i, j, k, c
-    real(dp) :: rr, sth, cth, rho, vr, vt, vp
+    real(dp) :: rho, vr
     call tic(T_R_EOS)
     if (.not. eos_fresh) call derived(ib, D_P1, C_ALL)
     eos_fresh = .false.
     call toc(T_R_EOS)
     call tic(T_R_MASS)
-    associate (th => Metric_DB(2, ib)%X_I)
-      ! ---- mass: -div(rho v)
-      do k = 1 - ng, nb(3) + ng
-        do j = 1 - ng, nb(2) + ng
-          do i = 1 - ng, nb(1) + ng
-            W_G(i, j, k) = r_c(i)**2*rho_G(i, j, k)*State_GVB(i, j, k, vr_, ib)
-          end do
+    ! ---- mass: -div(rho v)
+    do k = 1 - ng, nb(3) + ng
+      do j = 1 - ng, nb(2) + ng
+        do i = 1 - ng, nb(1) + ng
+          W_G(i, j, k) = rho_G(i, j, k)*State_GVB(i, j, k, vr_, ib)
         end do
       end do
-      call odd_wall_flux(W_G)
-      call ddr_block(W_G, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          do i = 1, nb(1)
-            R_CV(i, j, k, rho1_) = -Dr_C(i, j, k)/r_c(i)**2
-          end do
+    end do
+    call odd_wall_flux(W_G)
+    call ddr_block(W_G, Dr_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          R_CV(i, j, k, rho1_) = -Dr_C(i, j, k)
         end do
       end do
-      do k = 1 - ng, nb(3) + ng
-        do j = 1 - ng, nb(2) + ng
-          sth = sin(th(j))
-          do i = 1 - ng, nb(1) + ng
-            W_G(i, j, k) = sth*rho_G(i, j, k)*State_GVB(i, j, k, vt_, ib)
-          end do
+    end do
+    do k = 1 - ng, nb(3) + ng
+      do j = 1 - ng, nb(2) + ng
+        do i = 1 - ng, nb(1) + ng
+          W_G(i, j, k) = rho_G(i, j, k)*State_GVB(i, j, k, vt_, ib)
         end do
       end do
-      call arbor_deriv_cell(W_G, 2, ib, D_C)
-      do k = 1 - ng, nb(3) + ng
-        do j = 1 - ng, nb(2) + ng
-          do i = 1 - ng, nb(1) + ng
-            W_G(i, j, k) = rho_G(i, j, k)*State_GVB(i, j, k, vp_, ib)
-          end do
+    end do
+    call arbor_deriv_cell(W_G, 2, ib, D_C)
+    do k = 1 - ng, nb(3) + ng
+      do j = 1 - ng, nb(2) + ng
+        do i = 1 - ng, nb(1) + ng
+          W_G(i, j, k) = rho_G(i, j, k)*State_GVB(i, j, k, vp_, ib)
         end do
       end do
-      call arbor_deriv_cell(W_G, 3, ib, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          sth = sin(th(j))
-          do i = 1, nb(1)
-            R_CV(i, j, k, rho1_) = R_CV(i, j, k, rho1_) - (D_C(i, j, k) + Dr_C(i, j, k))/(r_c(i)*sth)
-            if (rsst_h2012) R_CV(i, j, k, rho1_) = R_CV(i, j, k, rho1_)/xi(i)**2
-          end do
+    end do
+    call arbor_deriv_cell(W_G, 3, ib, Dr_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          R_CV(i, j, k, rho1_) = R_CV(i, j, k, rho1_) - (D_C(i, j, k) + Dr_C(i, j, k))
+          if (rsst_h2012) R_CV(i, j, k, rho1_) = R_CV(i, j, k, rho1_)/xi(i)**2
         end do
       end do
+    end do
 
-      call toc(T_R_MASS)
-      ! ---- momentum and entropy: advection -(v.grad) q for q = v_r, v_theta, v_phi, s1
-      call tic(T_R_ADV)
-      do c = vr_, s1_
-        call ddr_block(State_GVB(:, :, :, c, ib), Dr_C)
-        do k = 1, nb(3)
-          do j = 1, nb(2)
-            do i = 1, nb(1)
-              R_CV(i, j, k, c) = -State_GVB(i, j, k, vr_, ib)*Dr_C(i, j, k)
-            end do
-          end do
-        end do
-        call arbor_deriv_cell(State_GVB, c, 2, ib, D_C)
-        do k = 1, nb(3)
-          do j = 1, nb(2)
-            do i = 1, nb(1)
-              R_CV(i, j, k, c) = R_CV(i, j, k, c) - State_GVB(i, j, k, vt_, ib)*D_C(i, j, k)/r_c(i)
-            end do
-          end do
-        end do
-        call arbor_deriv_cell(State_GVB, c, 3, ib, D_C)
-        do k = 1, nb(3)
-          do j = 1, nb(2)
-            sth = sin(th(j))
-            do i = 1, nb(1)
-              R_CV(i, j, k, c) = R_CV(i, j, k, c) - State_GVB(i, j, k, vp_, ib)*D_C(i, j, k)/(r_c(i)*sth)
-            end do
+    call toc(T_R_MASS)
+    ! ---- momentum and entropy: advection -(v.grad) q for q = v_z, v_x, v_y, s1
+    call tic(T_R_ADV)
+    do c = vr_, s1_
+      call ddr_block(State_GVB(:, :, :, c, ib), Dr_C)
+      do k = 1, nb(3)
+        do j = 1, nb(2)
+          do i = 1, nb(1)
+            R_CV(i, j, k, c) = -State_GVB(i, j, k, vr_, ib)*Dr_C(i, j, k)
           end do
         end do
       end do
+      call arbor_deriv_cell(State_GVB, c, 2, ib, D_C)
+      call arbor_deriv_cell(State_GVB, c, 3, ib, Dr_C)
+      do k = 1, nb(3)
+        do j = 1, nb(2)
+          do i = 1, nb(1)
+            R_CV(i, j, k, c) = R_CV(i, j, k, c) - State_GVB(i, j, k, vt_, ib)*D_C(i, j, k) &
+                - State_GVB(i, j, k, vp_, ib)*Dr_C(i, j, k)
+          end do
+        end do
+      end do
+    end do
 
-      call toc(T_R_ADV)
-      ! ---- pressure gradient, gravity on rho1, curvature terms, ds0/dr
-      call tic(T_R_PRS)
-      call ddr_block(p1_G, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          do i = 1, nb(1)
-            rho = rho_G(i, j, k)
-            R_CV(i, j, k, vr_) = R_CV(i, j, k, vr_) - (Dr_C(i, j, k) + g_c(i)*rq(i)*State_GVB(i, j, k, rho1_, ib))/rho
-            if (use_atmosphere) R_CV(i, j, k, vr_) = R_CV(i, j, k, vr_) - S_bgf(r_off + i)*bgforce(r_off + i)/rho
-            if (want_work) work_CB(i, j, k, ib) = -State_GVB(i, j, k, vr_, ib) &
-                *(Dr_C(i, j, k) + g_c(i)*rq(i)*State_GVB(i, j, k, rho1_, ib))
-          end do
+    call toc(T_R_ADV)
+    ! ---- pressure gradient, gravity on rho1, ds0/dz
+    call tic(T_R_PRS)
+    call ddr_block(p1_G, Dr_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          rho = rho_G(i, j, k)
+          R_CV(i, j, k, vr_) = R_CV(i, j, k, vr_) - (Dr_C(i, j, k) + g_c(i)*rq(i)*State_GVB(i, j, k, rho1_, ib))/rho
+          if (use_atmosphere) R_CV(i, j, k, vr_) = R_CV(i, j, k, vr_) - S_bgf(r_off + i)*bgforce(r_off + i)/rho
+          if (want_work) work_CB(i, j, k, ib) = -State_GVB(i, j, k, vr_, ib) &
+              *(Dr_C(i, j, k) + g_c(i)*rq(i)*State_GVB(i, j, k, rho1_, ib))
         end do
       end do
-      call arbor_deriv_cell(p1_G, 2, ib, D_C)
-      call arbor_deriv_cell(p1_G, 3, ib, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          sth = sin(th(j))
-          cth = cos(th(j))
-          do i = 1, nb(1)
-            rho = rho_G(i, j, k)
-            rr = r_c(i)
-            vr = State_GVB(i, j, k, vr_, ib)
-            vt = State_GVB(i, j, k, vt_, ib)
-            vp = State_GVB(i, j, k, vp_, ib)
-            R_CV(i, j, k, vr_) = R_CV(i, j, k, vr_) + (vt**2 + vp**2)/rr
-            if (want_work) then
-              workh_CB(i, j, k, ib) = -vt*D_C(i, j, k)/rr - vp*Dr_C(i, j, k)/(rr*sth)
-              work_CB(i, j, k, ib) = work_CB(i, j, k, ib) + workh_CB(i, j, k, ib)
-            end if
-            R_CV(i, j, k, vt_) = R_CV(i, j, k, vt_) - D_C(i, j, k)/(rr*rho) - (vr*vt - vp**2*cth/sth)/rr
-            R_CV(i, j, k, vp_) = R_CV(i, j, k, vp_) - Dr_C(i, j, k)/(rr*sth*rho) - (vr*vp + vt*vp*cth/sth)/rr
-            R_CV(i, j, k, s1_) = R_CV(i, j, k, s1_) - vr*ds0dr(i)
-          end do
+    end do
+    call arbor_deriv_cell(p1_G, 2, ib, D_C)
+    call arbor_deriv_cell(p1_G, 3, ib, Dr_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          rho = rho_G(i, j, k)
+          vr = State_GVB(i, j, k, vr_, ib)
+          if (want_work) then
+            workh_CB(i, j, k, ib) = -State_GVB(i, j, k, vt_, ib)*D_C(i, j, k) - State_GVB(i, j, k, vp_, ib)*Dr_C(i, j, k)
+            work_CB(i, j, k, ib) = work_CB(i, j, k, ib) + workh_CB(i, j, k, ib)
+          end if
+          R_CV(i, j, k, vt_) = R_CV(i, j, k, vt_) - D_C(i, j, k)/rho
+          R_CV(i, j, k, vp_) = R_CV(i, j, k, vp_) - Dr_C(i, j, k)/rho
+          R_CV(i, j, k, s1_) = R_CV(i, j, k, s1_) - vr*ds0dr(i)
         end do
       end do
-    end associate
+    end do
     call toc(T_R_PRS)
     if (use_B) call rhs_mhd(ib)
-    if (omega_rot /= 0.0_dp .and. coriolis == 'rk') call rhs_coriolis(ib)
   end subroutine rhs
-
-  ! The exact solution of dv/dt = -2 Omega x v over tau (each shell's own
-  ! tau tsc(i)): v rotated about the axis by phi = -2 omega_rot tau (Rodrigues,
-  ! the axis unit vector in the cell's spherical components as rhs_coriolis):
-  !   v' = v_par + cos(phi) v_perp + sin(phi) (n x v)
-  ! with_old: StateOld too (before the RK stages, which build on it)
-  subroutine coriolis_rotate(ib, tau, with_old)
-    integer, intent(in) :: ib
-    real(dp), intent(in) :: tau
-    logical, intent(in) :: with_old
-    integer :: i, j, k
-    real(dp) :: e(3,3), n(3), v(3), vpar(3), phi
-    real(dp), parameter :: zg(3) = [0.0_dp, 0.0_dp, 1.0_dp]
-    do k = 1, nb(3)
-      do j = 1, nb(2)
-        e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
-        if (Key_IB(KP, ib) == 2) then
-          n = matmul(transpose(e), yy_cart(zg))
-        else
-          n = matmul(transpose(e), zg)
-        end if
-        do i = 1, nb(1)
-          phi = -2.0_dp*omega_rot*tau*tsc(i)
-          v = State_GVB(i, j, k, vr_:vp_, ib)
-          vpar = dot_product(n, v)*n
-          State_GVB(i, j, k, vr_:vp_, ib) = vpar + cos(phi)*(v - vpar) &
-              + sin(phi)*[n(2)*v(3) - n(3)*v(2), n(3)*v(1) - n(1)*v(3), n(1)*v(2) - n(2)*v(1)]
-          if (with_old) StateOld_GVB(i, j, k, vr_:vp_, ib) = State_GVB(i, j, k, vr_:vp_, ib)
-        end do
-      end do
-    end do
-  end subroutine coriolis_rotate
-
-  ! Coriolis acceleration -2 Omega x v, Omega = omega_rot along the global z
-  ! axis: in the Yin frame z itself, in the Yang frame its local y (yy_cart
-  ! maps (0,0,1) to (0,1,0)); its spherical components from sph_basis, the
-  ! cross product in the orthonormal (r, theta, phi) basis
-  subroutine rhs_coriolis(ib)
-    integer, intent(in) :: ib
-    integer :: i, j, k
-    real(dp) :: e(3,3), om(3), v(3)
-    real(dp), parameter :: zg(3) = [0.0_dp, 0.0_dp, 1.0_dp]
-    do k = 1, nb(3)
-      do j = 1, nb(2)
-        e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
-        if (Key_IB(KP, ib) == 2) then
-          om = omega_rot*matmul(transpose(e), yy_cart(zg))
-        else
-          om = omega_rot*matmul(transpose(e), zg)
-        end if
-        do i = 1, nb(1)
-          v = State_GVB(i, j, k, vr_:vp_, ib)
-          R_CV(i, j, k, vr_:vp_) = R_CV(i, j, k, vr_:vp_) &
-              - 2.0_dp*[om(2)*v(3) - om(3)*v(2), om(3)*v(1) - om(1)*v(3), om(1)*v(2) - om(2)*v(1)]
-        end do
-      end do
-    end do
-  end subroutine rhs_coriolis
 
   ! ================================================================ magnetic field
 
@@ -1788,8 +1712,8 @@ contains
   !   R_v   += f (curl B) x B / (4 pi rho)   (f: the Alfven-speed cap, see lorentz_f)
   !   R_B    = curl(v x B) - grad psi
   !   R_psi  = -c_h^2 div B,  c_h = c_s0/xi + v_A
-  ! Curl and divergence in spherical components: radial derivatives with
-  ! CZTR's stencil (ddr_block), angular ones with ARBOR's (arbor_deriv_cell).
+  ! Curl and divergence in Cartesian components: z derivatives with CZTR's
+  ! stencil (ddr_block), x and y ones with ARBOR's (arbor_deriv_cell).
   subroutine rhs_mhd(ib)
     integer, intent(in) :: ib
     integer :: i, j, k
@@ -1831,7 +1755,7 @@ contains
     do k = 1, nb(3)
       do j = 1, nb(2)
         do i = 1, nb(1)
-          R_CV(i, j, k, bt_) = C_CV(i, j, k, 2) - D_C(i, j, k)/r_c(i)
+          R_CV(i, j, k, bt_) = C_CV(i, j, k, 2) - D_C(i, j, k)
         end do
       end do
     end do
@@ -1851,15 +1775,15 @@ contains
 !GCC$ ivdep
 !DIR$ IVDEP
           do i = 1, nb(1)
-            R_CV(i, j, k, bp_) = C_CV(i, j, k, 3) - D_C(i, j, k)/(r_c(i)*sn_t(j))
+            R_CV(i, j, k, bp_) = C_CV(i, j, k, 3) - D_C(i, j, k)
             b = State_GVB(i, j, k, br_:bp_, ib)
             jj = J_CV(i, j, k, :)
             rho = rho_G(i, j, k)
             rp = rho0(i) + rq(i)*State_GVB(i, j, k, rho1_, ib)
             b2 = sum(b**2)
             vm = norm2(State_GVB(i, j, k, vr_:vp_, ib))
-            dxm = min(drc_r(i), r_c(i)*dth(j), r_c(i)*sn_t(j)*dph(k))
-            dxg = min(drdxi_c(i), r_c(i)*dth(j), r_c(i)*sn_t(j)*dph(k))      ! (the GLM speed's cap: the old one)
+            dxm = min(drc_r(i), dth(j), dph(k))
+            dxg = min(drdxi_c(i), dth(j), dph(k))      ! (the GLM speed's cap: the old one)
             ! the force: cap(cell_cs), lorentz_f
             csl = sqrt(5.0_dp/3.0_dp*max(p0(i) + p1_G(i, j, k), 1.0e-30_dp)/rp)/xi(i)
             cap = merge(max(cfl*dxm/va_dt_target - (csl + vm), max(1.0e5_dp, va_floor_cs*csl*sw_r(i))), va_max, capon)
@@ -1872,7 +1796,7 @@ contains
             cap = merge(max(cfl*dxg/va_dt_target - (csl + vm), max(1.0e5_dp, va_floor_cs*csl*sw_r(i))), va_max, capon)
             f = merge(1.0_dp/sqrt(1.0_dp + (b2/(four_pi*rp*cap**2))**2), 1.0_dp, cap > 0.0_dp)
             ch = csl + sqrt(f*b2/(four_pi*rp))
-            s_inv = 1.0_dp/drdxi_c(i) + 1.0_dp/(r_c(i)*dth(j)) + 1.0_dp/(r_c(i)*sn_t(j)*dph(k))
+            s_inv = 1.0_dp/drdxi_c(i) + 1.0_dp/dth(j) + 1.0_dp/dph(k)
             ch = merge(max(ch, glm_cfl_frac*cfl/(s_inv*(tsc(i)*dt_now))), ch, glmc)
             R_CV(i, j, k, psi_) = -ch**2*divB_C(i, j, k)
           end do
@@ -1882,109 +1806,72 @@ contains
     call toc(T_R_MLOOP)
   end subroutine rhs_mhd
 
-  ! Curl of the spherical-component vector A_GV (cells with ghosts) at the
-  ! interior cells of block ib:
-  !   C_r     = [d_theta(sin theta A_phi) - d_phi A_theta] / (r sin theta)
-  !   C_theta = [d_phi A_r / sin theta - d_r(r A_phi)] / r
-  !   C_phi   = [d_r(r A_theta) - d_theta A_r] / r
+  ! Curl of the Cartesian vector A_GV = (A_z, A_x, A_y) (cells with ghosts)
+  ! at the interior cells of block ib (C in the same slots):
+  !   C_z = d_x A_y - d_y A_x
+  !   C_x = d_y A_z - d_z A_y
+  !   C_y = d_z A_x - d_x A_z
   subroutine curl_block(A_GV, ib, C)
     real(dp), intent(in) :: A_GV(1-ng:, 1-ng:, 1-ng:, :)
     integer, intent(in) :: ib
     real(dp), intent(out) :: C(:, :, :, :)
     integer :: i, j, k
-    ! (the components go to the derivatives directly; the scaled ones through
-    ! W_G, filled with i innermost)
-    associate (th => Metric_DB(2, ib)%X_I)
-      ! C_r
-      do k = 1 - ng, nb(3) + ng
-        do j = 1 - ng, nb(2) + ng
-          W_G(:, j, k) = sin(th(j))*A_GV(:, j, k, 3)
+    ! C_z
+    call arbor_deriv_cell(A_GV(:, :, :, 3), 2, ib, D_C)
+    call arbor_deriv_cell(A_GV(:, :, :, 2), 3, ib, Dr_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          C(i, j, k, 1) = D_C(i, j, k) - Dr_C(i, j, k)
         end do
       end do
-      call arbor_deriv_cell(W_G, 2, ib, D_C)
-      call arbor_deriv_cell(A_GV(:, :, :, 2), 3, ib, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          do i = 1, nb(1)
-            C(i, j, k, 1) = (D_C(i, j, k) - Dr_C(i, j, k))/(r_c(i)*sin(th(j)))
-          end do
+    end do
+    ! C_x
+    call arbor_deriv_cell(A_GV(:, :, :, 1), 3, ib, D_C)
+    call ddr_block(A_GV(:, :, :, 3), Dr_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          C(i, j, k, 2) = D_C(i, j, k) - Dr_C(i, j, k)
         end do
       end do
-      ! C_theta
-      call arbor_deriv_cell(A_GV(:, :, :, 1), 3, ib, D_C)
-      do k = 1 - ng, nb(3) + ng
-        do j = 1 - ng, nb(2) + ng
-          do i = 1 - ng, nb(1) + ng
-            W_G(i, j, k) = r_c(i)*A_GV(i, j, k, 3)
-          end do
+    end do
+    ! C_y
+    call ddr_block(A_GV(:, :, :, 2), Dr_C)
+    call arbor_deriv_cell(A_GV(:, :, :, 1), 2, ib, D_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          C(i, j, k, 3) = Dr_C(i, j, k) - D_C(i, j, k)
         end do
       end do
-      call ddr_block(W_G, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          do i = 1, nb(1)
-            C(i, j, k, 2) = (D_C(i, j, k)/sin(th(j)) - Dr_C(i, j, k))/r_c(i)
-          end do
-        end do
-      end do
-      ! C_phi
-      do k = 1 - ng, nb(3) + ng
-        do j = 1 - ng, nb(2) + ng
-          do i = 1 - ng, nb(1) + ng
-            W_G(i, j, k) = r_c(i)*A_GV(i, j, k, 2)
-          end do
-        end do
-      end do
-      call ddr_block(W_G, Dr_C)
-      call arbor_deriv_cell(A_GV(:, :, :, 1), 2, ib, D_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          do i = 1, nb(1)
-            C(i, j, k, 3) = (Dr_C(i, j, k) - D_C(i, j, k))/r_c(i)
-          end do
-        end do
-      end do
-    end associate
+    end do
   end subroutine curl_block
 
-  ! Divergence of the spherical-component vector A_GV at the interior cells:
-  !   (1/r^2) d_r(r^2 A_r) + [d_theta(sin theta A_theta) + d_phi A_phi] / (r sin theta)
+  ! Divergence of the Cartesian vector A_GV = (A_z, A_x, A_y) at the interior
+  ! cells: d_z A_z + d_x A_x + d_y A_y
   subroutine div_block(A_GV, ib, Dv)
     real(dp), intent(in) :: A_GV(1-ng:, 1-ng:, 1-ng:, :)
     integer, intent(in) :: ib
     real(dp), intent(out) :: Dv(:, :, :)
     integer :: i, j, k
-    associate (th => Metric_DB(2, ib)%X_I)
-      do k = 1 - ng, nb(3) + ng
-        do j = 1 - ng, nb(2) + ng
-          do i = 1 - ng, nb(1) + ng
-            W_G(i, j, k) = r_c(i)**2*A_GV(i, j, k, 1)
-          end do
+    call ddr_block(A_GV(:, :, :, 1), Dr_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          Dv(i, j, k) = Dr_C(i, j, k)
         end do
       end do
-      call ddr_block(W_G, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          do i = 1, nb(1)
-            Dv(i, j, k) = Dr_C(i, j, k)/r_c(i)**2
-          end do
+    end do
+    call arbor_deriv_cell(A_GV(:, :, :, 2), 2, ib, D_C)
+    call arbor_deriv_cell(A_GV(:, :, :, 3), 3, ib, Dr_C)
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          Dv(i, j, k) = Dv(i, j, k) + D_C(i, j, k) + Dr_C(i, j, k)
         end do
       end do
-      do k = 1 - ng, nb(3) + ng
-        do j = 1 - ng, nb(2) + ng
-          W_G(:, j, k) = sin(th(j))*A_GV(:, j, k, 2)
-        end do
-      end do
-      call arbor_deriv_cell(W_G, 2, ib, D_C)
-      call arbor_deriv_cell(A_GV(:, :, :, 3), 3, ib, Dr_C)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          do i = 1, nb(1)
-            Dv(i, j, k) = Dv(i, j, k) + (D_C(i, j, k) + Dr_C(i, j, k))/(r_c(i)*sin(th(j)))
-          end do
-        end do
-      end do
-    end associate
+    end do
   end subroutine div_block
 
   ! The GLM cleaning speed of a cell: c_s0/xi + v_A ('fast'; v_A capped, see
@@ -1996,10 +1883,9 @@ contains
     ! propagates explicitly in r; va_cap is va_eff(cell_cap(...)) from scalars)
     ch = cs0(i)/xi(i) + va_cap(sum(State_GVB(i, j, k, br_:bp_, ib)**2), rho0(i) + rq(i)*State_GVB(i, j, k, rho1_, ib), &
         cs0(i)/xi(i), norm2(State_GVB(i, j, k, vr_:vp_, ib)), &
-        min(drdxi_c(i), r_c(i)*Metric_DB(2, ib)%Dx_I(j), r_c(i)*sn_t(j)*Metric_DB(3, ib)%Dx_I(k)), sw_r(i))
+        min(drdxi_c(i), Metric_DB(2, ib)%Dx_I(j), Metric_DB(3, ib)%Dx_I(k)), sw_r(i))
     ! ('cfl': branch-free, so the cell loops calling it vectorize)
-    s_inv = 1.0_dp/drdxi_c(i) + 1.0_dp/(r_c(i)*Metric_DB(2, ib)%Dx_I(j)) &
-        + 1.0_dp/(r_c(i)*sn_t(j)*Metric_DB(3, ib)%Dx_I(k))
+    s_inv = 1.0_dp/drdxi_c(i) + 1.0_dp/Metric_DB(2, ib)%Dx_I(j) + 1.0_dp/Metric_DB(3, ib)%Dx_I(k)
     dti = tsc(i)*dt_now
     ch = merge(max(ch, glm_cfl_frac*cfl/(s_inv*dti)), ch, glm_cfl .and. dt_now > 0.0_dp)
   end function ch_cell
@@ -2045,8 +1931,8 @@ contains
     real(dp), intent(in) :: cs
     real(dp) :: dxm, fl
     ! (branch-free, so the cell loops calling it vectorize: sw_r = 0 without
-    ! the atmosphere; va_dt_target = 0: va_max. sw_r, sn_t: cz_bind's, of block ib)
-    dxm = min(drc_r(i), r_c(i)*Metric_DB(2, ib)%Dx_I(j), r_c(i)*sn_t(j)*Metric_DB(3, ib)%Dx_I(k))
+    ! the atmosphere; va_dt_target = 0: va_max. sw_r: cz_bind's, of block ib)
+    dxm = min(drc_r(i), Metric_DB(2, ib)%Dx_I(j), Metric_DB(3, ib)%Dx_I(k))
     fl = max(1.0e5_dp, va_floor_cs*cs*sw_r(i))
     c = merge(max(cfl*dxm/va_dt_target - (cs + norm2(State_GVB(i, j, k, vr_:vp_, ib))), fl), va_max, &
         va_dt_target > 0.0_dp)
@@ -2071,110 +1957,18 @@ contains
     cs = sqrt(5.0_dp/3.0_dp*max(p0(i) + p1_G(i, j, k), 1.0e-30_dp)/rho)/xi(i)
   end function cell_cs
 
-  ! The Coriolis impulse of this step on L_z, each shell with its own step
-  ! (local stepping): sum of -2 Omega rho s v_s dV tsc(i) dt; also sets the
-  ! reference L_z at the first call (the run's start or restart)
-  subroutine lz_impulse(dt)
-    real(dp), intent(in) :: dt
-    integer :: jb, ib, i, j, k
-    real(dp) :: e(3,3), x(3), vc(3), w, th, ph, th2, ph2, imp, lz
-    if (.not. lz_ref_set) then
-      call angular_momentum(lz)
-      lz_ref = lz;  lz_imp = 0.0_dp;  lz_ref_set = .true.
-      t_next_lzc = 0.0_dp
-    end if
-    if (omega_rot == 0.0_dp) return
-    imp = 0.0_dp
-    do jb = 1, nBlock
-      ib = iBlockList_I(jb)
-      call cz_bind(ib)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          th = Metric_DB(2, ib)%X_I(j);  ph = Metric_DB(3, ib)%X_I(k)
-          if (.not. yy_core(th, ph)) cycle
-          w = Metric_DB(2, ib)%Vol_I(j)*Metric_DB(3, ib)%Vol_I(k)
-          call yy_angles(th, ph, th2, ph2)
-          if (yy_core(th2, ph2)) w = 0.5_dp*w
-          e = sph_basis(th, ph)
-          do i = 1, nb(1)
-            x = r_c(i)*e(:, 1)
-            vc = matmul(e, State_GVB(i, j, k, vr_:vp_, ib))
-            if (Key_IB(KP, ib) == 2) then
-              x = yy_cart(x);  vc = yy_cart(vc)
-            end if
-            imp = imp + w*Metric_DB(1, ib)%Vol_I(i)*(rho0(i) + State_GVB(i, j, k, rho1_, ib)) &
-                *(x(1)*vc(1) + x(2)*vc(2))*tsc(i)
-          end do
-        end do
-      end do
-    end do
-    call cz_unbind()
-    lz_imp = lz_imp - 2.0_dp*omega_rot*dt*arbor_sum(imp)
-  end subroutine lz_impulse
-
-  ! the Yin-Yang core (theta in [pi/4, 3pi/4], |phi| <= 3pi/4)
-  pure logical function yy_core(t, p)
-    real(dp), intent(in) :: t, p
-    yy_core = t >= 0.25_dp*pi .and. t <= 0.75_dp*pi .and. abs(p) <= 0.75_dp*pi
-  end function yy_core
-
-  ! Angular momentum of the flow about the global z axis, L_z = int rho (x
-  ! cross v)_z dV with rho = rho0 + rho1 and the global Cartesian position and
-  ! velocity (Yang mapped by yy_cart); Yin-Yang overlap weights as the budget's
-  subroutine angular_momentum(lz, tcor)
-    real(dp), intent(out) :: lz
-    real(dp), intent(out), optional :: tcor
-    integer :: jb, ib, i, j, k
-    real(dp) :: e(3,3), x(3), vc(3), w, th, ph, th2, ph2, svs
-    lz = 0.0_dp;  svs = 0.0_dp
-    do jb = 1, nBlock
-      ib = iBlockList_I(jb)
-      call cz_bind(ib)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          th = Metric_DB(2, ib)%X_I(j);  ph = Metric_DB(3, ib)%X_I(k)
-          if (.not. core(th, ph)) cycle
-          w = Metric_DB(2, ib)%Vol_I(j)*Metric_DB(3, ib)%Vol_I(k)
-          call yy_angles(th, ph, th2, ph2)
-          if (core(th2, ph2)) w = 0.5_dp*w
-          e = sph_basis(th, ph)
-          do i = 1, nb(1)
-            x = r_c(i)*e(:, 1)
-            vc = matmul(e, State_GVB(i, j, k, vr_:vp_, ib))
-            if (Key_IB(KP, ib) == 2) then
-              x = yy_cart(x);  vc = yy_cart(vc)
-            end if
-            lz = lz + w*Metric_DB(1, ib)%Vol_I(i)*(rho0(i) + State_GVB(i, j, k, rho1_, ib))*(x(1)*vc(2) - x(2)*vc(1))
-            ! s v_s = x vx + y vy (the distance from the axis times the velocity away from it)
-            svs = svs + w*Metric_DB(1, ib)%Vol_I(i)*(rho0(i) + State_GVB(i, j, k, rho1_, ib))*(x(1)*vc(1) + x(2)*vc(2))
-          end do
-        end do
-      end do
-    end do
-    call cz_unbind()
-    lz = arbor_sum(lz)
-    ! the Coriolis torque on the flow: -2 Omega int rho s v_s dV (= -Omega dI_z/dt)
-    if (present(tcor)) tcor = -2.0_dp*omega_rot*arbor_sum(svs)
-  contains
-    logical function core(t, p)
-      real(dp), intent(in) :: t, p
-      core = t >= 0.25_dp*pi .and. t <= 0.75_dp*pi .and. abs(p) <= 0.75_dp*pi
-    end function core
-  end subroutine angular_momentum
-
   ! GLM: psi damped over the step by exp(-dt alpha_glm c_h / dx_min) (each
   ! shell's own step with local stepping)
   subroutine glm_damp(ib, dt)
     integer, intent(in) :: ib
     real(dp), intent(in) :: dt
     integer :: i, j, k
-    real(dp) :: ch, dxm, sth
+    real(dp) :: ch, dxm
     do k = 1, nb(3)
       do j = 1, nb(2)
-        sth = sin(Metric_DB(2, ib)%X_I(j))
         do i = 1, nb(1)
           ch = ch_cell(i, j, k, ib)
-          dxm = min(drdxi_c(i), r_c(i)*Metric_DB(2, ib)%Dx_I(j), r_c(i)*sth*Metric_DB(3, ib)%Dx_I(k))
+          dxm = min(drdxi_c(i), Metric_DB(2, ib)%Dx_I(j), Metric_DB(3, ib)%Dx_I(k))
           State_GVB(i, j, k, psi_, ib) = State_GVB(i, j, k, psi_, ib)*exp(-tsc(i)*dt*alpha_glm*ch/dxm)
         end do
       end do
@@ -2261,7 +2055,7 @@ contains
           end if
           call transport_column(dt, rho, T, P, cp, cv, Q, lnrho, q6(:, 2), q6(:, 1), q6(:, 5), State_GVB(:, j, k, vr_, ib), &
               s1, qc, &
-              f_mlt, alpha_mlt, cfl, L_bottom_Lsun*Lsun, grey_tau_above, use_radiation, use_convection, &
+              f_mlt, alpha_mlt, cfl, F_bottom, grey_tau_above, use_radiation, use_convection, &
               use_hyperbolic, first, qrad_FB(:, j, k, ib), Qrad, wall_top == 'face' .or. use_atmosphere, tsx)
           if (budget_on .and. .not. first) then
             ! radiation (with L_bottom) and the exact cooling of each cell
@@ -2386,8 +2180,6 @@ contains
     integer :: i, j, k, c
     real(dp) :: wr(0:nb(1)), wh(1:nb(1))
     real(dp) :: vol, outflow, rho_new, a1, a2, a3, ho, s1o, ke_o, dE_act, dti, kh_o, eb_o
-    ! sin theta at the cell centres (snt) and at the theta faces between them (snf: face j between j and j+1)
-    real(dp) :: snt(0:nb(2)+1), snf(0:nb(2))
     logical :: blend_r, blend_h, b_resist, b_j4
     call tic(T_D_PRE)
     ! the top-layer blend weights at the radial faces (wr) and the cells (wh: horizontal faces)
@@ -2405,14 +2197,6 @@ contains
     b_resist = use_B .and. b_diff_form == 'resistive'
     b_j4 = b_diffusion_h < 0.0_dp .and. b_diff_limiter == 'minmod'
     if (b_resist) then
-      associate (th => Metric_DB(2, ib)%X_I)
-        do j = 0, nb(2) + 1
-          snt(j) = sin(th(j))
-        end do
-        do j = 0, nb(2)
-          snf(j) = sin(0.5_dp*(th(j) + th(j+1)))
-        end do
-      end associate
       if (.not. allocated(dB_C)) allocate(dB_C(0:nb(1)+1, 0:nb(2)+1, 0:nb(3)+1, 6))
       call bcell_derivs()
     end if
@@ -2591,7 +2375,7 @@ contains
       m = nb(1)
       do c = c1, c2
         par = merge(-1.0_dp, 1.0_dp, c == vr_)
-        if (at_top .and. wall_top /= 'outflow') then
+        if (at_top .and. wall_top /= 'box') then
           if (wall_top == 'cell') then
             F1_FV(m, :, :, c) = -par*F1_FV(m - 1, :, :, c)
           else if (c /= vr_) then
@@ -2753,99 +2537,59 @@ contains
     end subroutine faces_b
 
     ! b_diff_form = 'resistive': the face fluxes -eta_f (qn + qt)/ds of B_m
-    ! across the faces normal to d (m /= d), i.e. -eta J with
-    ! ds_d (d_d B_m - d_m B_d) in spherical form, ds_d/(h_d h_m) [d_d(h_m B_m)
-    ! - d_m(h_d B_d)], h = (1, r, r sin theta): qn the normal derivative's term
-    ! (a compact jump across the face), qt the tangential one (the mean of the
-    ! two cells' central differences, dB_C from bcell_derivs); ds = ds_d the
-    ! distance of the two centres, eta_f the mean of the two cells' eta. On a
-    ! radial face qn only with b_eta_radial = 'explicit' (implicit:
-    ! b_radial_implicit). Fv: the faces of one direction (as F in faces_b).
+    ! across the faces normal to d (m /= d), i.e. -eta J with ds (d_d B_m -
+    ! d_m B_d) (Cartesian): qn the normal derivative's term (a compact jump
+    ! across the face), qt the tangential one (the mean of the two cells'
+    ! central differences, dB_C from bcell_derivs); ds the distance of the two
+    ! centres, eta_f the mean of the two cells' eta. On a vertical face qn
+    ! only with b_eta_radial = 'explicit' (implicit: b_radial_implicit). Fv:
+    ! the faces of one direction (as F in faces_b). Slots: 1 z, 2 x, 3 y.
     ! (State_GVB and EtaB_GB indexed directly: an associate name for an array
     ! section would start at 1, not at the ghosts' 1 - ng)
     subroutine bfaces(d, m, Fv)
       integer, intent(in) :: d, m
       real(dp), intent(out) :: Fv(1-merge(1, 0, d == 1):nb(1), 1-merge(1, 0, d == 2):nb(2), 1-merge(1, 0, d == 3):nb(3))
-      integer :: i, j, k
-      real(dp) :: dx, rf, sf, a, qn, qt, ds
-      associate (th => Metric_DB(2, ib)%X_I, ph => Metric_DB(3, ib)%X_I)
-      select case (10*d + m)
-      case (12)                                           ! radial faces, B_theta: d_r(r B_theta) - d_theta B_r
+      integer :: i, j, k, c, n
+      real(dp) :: dx, a, qn, qt
+      associate (xx => Metric_DB(2, ib)%X_I, yy => Metric_DB(3, ib)%X_I)
+      c = br_ + m - 1                                     ! the component B_m
+      select case (d)
+      case (1)                                            ! z faces, B_x (n 1: d_x B_z) or B_y (n 2: d_y B_z)
+        n = m - 1
         do k = 1, nb(3)
           do j = 1, nb(2)
             do i = 0, nb(1)
               dx = r_c(i+1) - r_c(i)
-              rf = 0.5_dp*(r_c(i) + r_c(i+1))
-              a = dB_C(i, j, k, 1) + dB_C(i+1, j, k, 1)
-              qn = merge((r_c(i+1)*State_GVB(i+1, j, k, bt_, ib) - r_c(i)*State_GVB(i, j, k, bt_, ib))/rf, 0.0_dp, b_eta_explicit)
-              qt = -0.5_dp*dx*a/rf
+              a = dB_C(i, j, k, n) + dB_C(i+1, j, k, n)
+              qn = merge(State_GVB(i+1, j, k, c, ib) - State_GVB(i, j, k, c, ib), 0.0_dp, b_eta_explicit)
+              qt = -0.5_dp*dx*a
               Fv(i, j, k) = -0.5_dp*(EtaB_GB(i, j, k, 1, ib) + EtaB_GB(i+1, j, k, 1, ib))*(qn + qt)/dx
             end do
           end do
         end do
-      case (13)                                           ! radial faces, B_phi: d_r(r B_phi) - d_phi B_r/sin
-        do k = 1, nb(3)
-          do j = 1, nb(2)
-            do i = 0, nb(1)
-              dx = r_c(i+1) - r_c(i)
-              rf = 0.5_dp*(r_c(i) + r_c(i+1))
-              a = dB_C(i, j, k, 2) + dB_C(i+1, j, k, 2)
-              qn = merge((r_c(i+1)*State_GVB(i+1, j, k, bp_, ib) - r_c(i)*State_GVB(i, j, k, bp_, ib))/rf, 0.0_dp, b_eta_explicit)
-              qt = -0.5_dp*dx*a/(rf*snt(j))
-              Fv(i, j, k) = -0.5_dp*(EtaB_GB(i, j, k, 1, ib) + EtaB_GB(i+1, j, k, 1, ib))*(qn + qt)/dx
-            end do
-          end do
-        end do
-      case (21)                                           ! theta faces, B_r: d_theta B_r - d_r(r B_theta)
+      case (2)                                            ! x faces, B_z (n 3: d_z B_x) or B_y (n 4: d_y B_x)
+        n = merge(3, 4, m == 1)
         do k = 1, nb(3)
           do j = 0, nb(2)
-            dx = th(j+1) - th(j)
+            dx = xx(j+1) - xx(j)
             do i = 1, nb(1)
-              ds = r_c(i)*dx
-              a = dB_C(i, j, k, 3) + dB_C(i, j+1, k, 3)
-              qn = State_GVB(i, j+1, k, br_, ib) - State_GVB(i, j, k, br_, ib)
+              a = dB_C(i, j, k, n) + dB_C(i, j+1, k, n)
+              qn = State_GVB(i, j+1, k, c, ib) - State_GVB(i, j, k, c, ib)
               qt = -0.5_dp*dx*a
-              Fv(i, j, k) = -0.5_dp*(EtaB_GB(i, j, k, 1, ib) + EtaB_GB(i, j+1, k, 1, ib))*(qn + qt)/ds
+              Fv(i, j, k) = -0.5_dp*(EtaB_GB(i, j, k, 1, ib) + EtaB_GB(i, j+1, k, 1, ib))*(qn + qt)/dx
             end do
           end do
         end do
-      case (23)                                           ! theta faces, B_phi: d_theta(sin B_phi)/sin - d_phi B_theta/sin
-        do k = 1, nb(3)
-          do j = 0, nb(2)
-            dx = th(j+1) - th(j)
-            sf = snf(j)
-            do i = 1, nb(1)
-              ds = r_c(i)*dx
-              a = dB_C(i, j, k, 4) + dB_C(i, j+1, k, 4)
-              qn = (snt(j+1)*State_GVB(i, j+1, k, bp_, ib) - snt(j)*State_GVB(i, j, k, bp_, ib))/sf
-              qt = -0.5_dp*dx*a/sf
-              Fv(i, j, k) = -0.5_dp*(EtaB_GB(i, j, k, 1, ib) + EtaB_GB(i, j+1, k, 1, ib))*(qn + qt)/ds
-            end do
-          end do
-        end do
-      case (31)                                           ! phi faces, B_r: d_phi B_r - sin d_r(r B_phi)
+      case (3)                                            ! y faces, B_z (n 5: d_z B_y) or B_x (n 6: d_x B_y)
+        n = merge(5, 6, m == 1)
         do k = 0, nb(3)
-          dx = ph(k+1) - ph(k)
+          dx = yy(k+1) - yy(k)
           do j = 1, nb(2)
             do i = 1, nb(1)
-              ds = r_c(i)*snt(j)*dx
-              a = dB_C(i, j, k, 5) + dB_C(i, j, k+1, 5)
-              qn = State_GVB(i, j, k+1, br_, ib) - State_GVB(i, j, k, br_, ib)
-              qt = -0.5_dp*dx*snt(j)*a
-              Fv(i, j, k) = -0.5_dp*(EtaB_GB(i, j, k, 1, ib) + EtaB_GB(i, j, k+1, 1, ib))*(qn + qt)/ds
-            end do
-          end do
-        end do
-      case (32)                                           ! phi faces, B_theta: d_phi B_theta - d_theta(sin B_phi)
-        do k = 0, nb(3)
-          dx = ph(k+1) - ph(k)
-          do j = 1, nb(2)
-            do i = 1, nb(1)
-              ds = r_c(i)*snt(j)*dx
-              a = dB_C(i, j, k, 6) + dB_C(i, j, k+1, 6)
-              qn = State_GVB(i, j, k+1, bt_, ib) - State_GVB(i, j, k, bt_, ib)
+              a = dB_C(i, j, k, n) + dB_C(i, j, k+1, n)
+              qn = State_GVB(i, j, k+1, c, ib) - State_GVB(i, j, k, c, ib)
               qt = -0.5_dp*dx*a
-              Fv(i, j, k) = -0.5_dp*(EtaB_GB(i, j, k, 1, ib) + EtaB_GB(i, j, k+1, 1, ib))*(qn + qt)/ds
+              Fv(i, j, k) = -0.5_dp*(EtaB_GB(i, j, k, 1, ib) + EtaB_GB(i, j, k+1, 1, ib))*(qn + qt)/dx
             end do
           end do
         end do
@@ -2855,33 +2599,33 @@ contains
 
     ! the cells' central differences the face currents use (dB_C(:, :, :, n)),
     ! each once per block, where the faces need them (one cell beyond the
-    ! block in the faces' direction): 1 d_theta B_r, 2 d_phi B_r (cells i =
-    ! 0..nb+1; radial faces), 3 d_r(r B_theta), 4 d_phi B_theta (j = 0..nb+1;
-    ! theta faces), 5 d_r(r B_phi), 6 d_theta(sin theta B_phi) (k = 0..nb+1; phi faces)
+    ! block in the faces' direction): 1 d_x B_z, 2 d_y B_z (cells i =
+    ! 0..nb+1; z faces), 3 d_z B_x, 4 d_y B_x (j = 0..nb+1; x faces),
+    ! 5 d_z B_y, 6 d_x B_y (k = 0..nb+1; y faces)
     subroutine bcell_derivs()
       integer :: i, j, k
-      associate (th => Metric_DB(2, ib)%X_I, ph => Metric_DB(3, ib)%X_I)
+      associate (xx => Metric_DB(2, ib)%X_I, yy => Metric_DB(3, ib)%X_I)
       do k = 1, nb(3)
         do j = 1, nb(2)
           do i = 0, nb(1) + 1
-            dB_C(i, j, k, 1) = (State_GVB(i, j+1, k, br_, ib) - State_GVB(i, j-1, k, br_, ib))/(th(j+1) - th(j-1))
-            dB_C(i, j, k, 2) = (State_GVB(i, j, k+1, br_, ib) - State_GVB(i, j, k-1, br_, ib))/(ph(k+1) - ph(k-1))
+            dB_C(i, j, k, 1) = (State_GVB(i, j+1, k, br_, ib) - State_GVB(i, j-1, k, br_, ib))/(xx(j+1) - xx(j-1))
+            dB_C(i, j, k, 2) = (State_GVB(i, j, k+1, br_, ib) - State_GVB(i, j, k-1, br_, ib))/(yy(k+1) - yy(k-1))
           end do
         end do
       end do
       do k = 1, nb(3)
         do j = 0, nb(2) + 1
           do i = 1, nb(1)
-            dB_C(i, j, k, 3) = (r_c(i+1)*State_GVB(i+1, j, k, bt_, ib) - r_c(i-1)*State_GVB(i-1, j, k, bt_, ib))/(r_c(i+1) - r_c(i-1))
-            dB_C(i, j, k, 4) = (State_GVB(i, j, k+1, bt_, ib) - State_GVB(i, j, k-1, bt_, ib))/(ph(k+1) - ph(k-1))
+            dB_C(i, j, k, 3) = (State_GVB(i+1, j, k, bt_, ib) - State_GVB(i-1, j, k, bt_, ib))/(r_c(i+1) - r_c(i-1))
+            dB_C(i, j, k, 4) = (State_GVB(i, j, k+1, bt_, ib) - State_GVB(i, j, k-1, bt_, ib))/(yy(k+1) - yy(k-1))
           end do
         end do
       end do
       do k = 0, nb(3) + 1
         do j = 1, nb(2)
           do i = 1, nb(1)
-            dB_C(i, j, k, 5) = (r_c(i+1)*State_GVB(i+1, j, k, bp_, ib) - r_c(i-1)*State_GVB(i-1, j, k, bp_, ib))/(r_c(i+1) - r_c(i-1))
-            dB_C(i, j, k, 6) = (snt(j+1)*State_GVB(i, j+1, k, bp_, ib) - snt(j-1)*State_GVB(i, j-1, k, bp_, ib))/(th(j+1) - th(j-1))
+            dB_C(i, j, k, 5) = (State_GVB(i+1, j, k, bp_, ib) - State_GVB(i-1, j, k, bp_, ib))/(r_c(i+1) - r_c(i-1))
+            dB_C(i, j, k, 6) = (State_GVB(i, j+1, k, bp_, ib) - State_GVB(i, j-1, k, bp_, ib))/(xx(j+1) - xx(j-1))
           end do
         end do
       end do

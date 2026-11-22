@@ -1,7 +1,8 @@
 program cz3d_run
-  ! CZTR step 1 in 3D: the convection zone on a Yin-Yang shell (ARBOR), the
-  ! 1D grid in r (whole columns or nb_r cells per block), the 1D state as the
-  ! initial condition in every column. See cz3d_app_mod.
+  ! CZTR_box: CZTR_3D in a Cartesian box (ARBOR's box, periodic in x and y),
+  ! the 1D grid in z (ARBOR's first direction; whole columns or nb_r cells
+  ! per block), the 1D state as the initial condition in every column. See
+  ! cz3d_app_mod.
   !
   ! Usage: mpirun -np N ./cztr3d.x [run.nml]
   use arbor
@@ -15,7 +16,7 @@ program cz3d_run
   type(arbor_domain_t) :: dom
   type(arbor_tree_t) :: tree
   type(cz3d_app_t) :: app
-  type(arbor_map1d_t) :: map_r
+  type(arbor_map1d_t) :: map_r, map_x, map_y
   character(len=256) :: file
   character(len=300) :: msg
   real(dp) :: t, wall
@@ -55,23 +56,17 @@ program cz3d_run
   if (use_atmosphere) call atm_init()
   call transport_init(opacity_file)
   if (cool_width_hp > 0.0_dp) cool_width_km = cool_width_hp*p0(n_r)/(rho0(n_r)*g_c(n_r))/1.0e5_dp
-  if (top_energy == 'cooling') call set_top_cooling(L_bottom_Lsun*Lsun, cool_width_km*1.0e5_dp)
+  if (top_energy == 'cooling') call set_top_cooling(L_bottom_Lsun*Lsun/(4.0_dp*pi*r_top_cz**2), cool_width_km*1.0e5_dp)
   call set_rsst(c_target, rsst_q, rsst_depth_km)
 
   map_r = arbor_map_table(r_f(0:n_r))
   call arbor_map_set_extension(map_r, MAP_EXT_LINEAR, MAP_EXT_LINEAR)
   if (nb_r <= 0) nb_r = n_r
   if (mod(n_r, nb_r) /= 0) call arbor_abort('cz3d: nb_r must divide the radial cells')
-  if (yy_margin >= 0) then
-    call arbor_domain_yinyang(dom, [nb_r, nb_theta, nb_phi], 2, map_r, n_theta, n_phi, margin_cells=yy_margin)
-  else
-    call arbor_domain_yinyang(dom, [nb_r, nb_theta, nb_phi], 2, map_r, n_theta, n_phi)
-  end if
-  if (use_B) then
-    call arbor_set_vectors([vr_, br_])            ! velocity and field: rotated between the Yin-Yang frames
-  else
-    call arbor_set_vectors([vr_])
-  end if
+  ! x and y [cm] periodic over box_lx_mm, box_ly_mm
+  map_x = arbor_map_uniform(0.0_dp, box_lx_mm*1.0e8_dp, n_x, periodic=.true.)
+  map_y = arbor_map_uniform(0.0_dp, box_ly_mm*1.0e8_dp, n_y, periodic=.true.)
+  call arbor_domain_box(dom, [nb_r, nb_x, nb_y], 2, map_r, map_x, map_y)
   call arbor_block_init(dom, n_var=cz_n_var(), n_var_face=merge(1, 0, qconv_face))
   select case (ghost_limiter)                      ! (the ghost interpolation's slope limiter)
   case ('mc');   iLimiter = LIMITER_MC
@@ -88,7 +83,7 @@ program cz3d_run
       call arbor_restart_read(app, restart_from, dom, tree, t, i_step, domain_tol=restart_domain_tol)
       n_var_file = cz_n_var()
     end if
-    call arbor_ghost_build(tree, dom, bc=wall_bc, bounded=.true.)   ! no negative Yin-Yang ghosts (ARBOR 831b389)
+    call arbor_ghost_build(tree, dom, bc=wall_bc, bounded=.true.)   ! (no negative ghosts from the interpolation)
     call cz_setup()
     if (n_var_file < cz_n_var()) call cz_field_from_hydro()
     if (import_cz_on_restart) call cz_import_cz()
@@ -110,7 +105,7 @@ program cz3d_run
     call arbor_tree_init(tree, dom, [0, max(refine_h, patch_level), max(refine_h, patch_level)])
     call arbor_tree_refine(tree, dom, import_criterion)
     call arbor_block_sync(tree)
-    call arbor_ghost_build(tree, dom, bc=wall_bc, bounded=.true.)   ! no negative Yin-Yang ghosts (ARBOR 831b389)
+    call arbor_ghost_build(tree, dom, bc=wall_bc, bounded=.true.)   ! (no negative ghosts from the interpolation)
     call cz_setup()
     call arbor_init_blocks(app)
     t = 0.0_dp
@@ -123,24 +118,25 @@ program cz3d_run
   else
     call arbor_tree_init(tree, dom, [0, 0, 0])
     call arbor_block_sync(tree)
-    call arbor_ghost_build(tree, dom, bc=wall_bc, bounded=.true.)   ! no negative Yin-Yang ghosts (ARBOR 831b389)
+    call arbor_ghost_build(tree, dom, bc=wall_bc, bounded=.true.)   ! (no negative ghosts from the interpolation)
     call cz_setup()
     call arbor_init_blocks(app)
     t = 0.0_dp
     i_step = 0
   end if
-  ! the PFSS field above the join from the CZ's B_r: on a fresh start, an
-  ! import, or a hydrodynamic restart (not on a restart that has B)
-  if (use_B .and. (b_seed == 'pfss' .or. b_seed == 'dpf') .and. (len_trim(restart_from) == 0 .or. n_var_file < cz_n_var())) then
+  ! the potential field above the join from the CZ's B_z: on a fresh start,
+  ! an import, or a hydrodynamic restart (not on a restart that has B)
+  if (use_B .and. b_seed == 'potential' .and. (len_trim(restart_from) == 0 .or. n_var_file < cz_n_var())) then
     call cz_smooth_b()                               ! (b_smooth_cells > 0: the CZ's field smoothed horizontally first)
-    call cz_seed_pfss()
+    call cz_seed_potential()
   end if
   if (is_root) call execute_command_line('mkdir -p '//trim(out_dir))
   call arbor_barrier()
   if (is_root) call write_background()
 
-  write(msg, '(A,I0,A,I0,A,I0,A,F6.3,A,I0,A,I0,A)') 'cz3d: ', n_r, ' radial cells (1D join cell ', k_join, '), Yin-Yang ', &
-      n_theta, ' x ', 90.0_dp/real(n_theta - 2*merge(yy_margin, 3, yy_margin >= 0), dp), ' deg, ', tree%n_leaf, ' blocks on ', n_ranks, ' ranks'
+  write(msg, '(A,I0,A,I0,A,I0,A,I0,A,F8.1,A,F8.1,A,F7.3,A,I0,A,I0,A)') 'cztr_box: ', n_r, ' vertical cells (1D join cell ', &
+      k_join, '), ', n_x, ' x ', n_y, ' columns over ', box_lx_mm, ' x ', box_ly_mm, ' Mm (dx ', box_lx_mm/n_x, ' Mm), ', &
+      tree%n_leaf, ' blocks on ', n_ranks, ' ranks'
   call arbor_print(msg)
   if (use_atmosphere) then
     write(msg, '(A,L1,A,L1,A,L1,A,F8.1,A,F6.1,A,ES9.2,A,F8.1,A,L1)') '  atmosphere: conduction ', use_conduction, &
@@ -168,7 +164,7 @@ program cz3d_run
         ' steps, then to 0 over ', dt1_ramp_steps, ' steps'
     call arbor_print(msg)
   end if
-  write(msg, '(A,F9.1,A,F9.1,A,A,A,A,A,L1,A,F5.2)') '  r from ', (r_f(0) - r_top_cz)/1.0e5_dp, ' to ', &
+  write(msg, '(A,F9.1,A,F9.1,A,A,A,A,A,L1,A,F5.2)') '  z from ', (r_f(0) - r_top_cz)/1.0e5_dp, ' to ', &
       (r_f(n_r) - r_top_cz)/1.0e5_dp, ' km; walls: bottom ', trim(wall_bottom), ', top ', trim(wall_top), &
       '; MLT switch ', mlt_switch, '; diffusion h = ', diffusion_h
   call arbor_print(msg)
@@ -211,8 +207,7 @@ program cz3d_run
   if (UseMultirate) call print_radial_levels()
 
   if (plot_blocks) then
-    ! (each block drawn as 1 x 4 x 4 bricks so the curved blocks bend)
-    call arbor_plot_blocks(tree, dom, trim(out_dir)//'/blocks.dat', sub=[1, 4, 4])
+    call arbor_plot_blocks(tree, dom, trim(out_dir)//'/blocks.dat')
     call arbor_print('  block outlines: '//trim(out_dir)//'/blocks.dat')
   end if
   ! as CZTR: the convective fluxes start at their targets; after a restart
@@ -264,7 +259,6 @@ program cz3d_run
   ! the largest Mach number's cell (stderr), and a plot at the end if asked
   call max_mach_report(i_step + n_step, t)
   if (plot_at_end) call app%write_plot(dom, i_step + n_step, t)
-  if (euv_at_end) call euv_write(i_step + n_step, t)
   ! a restart file at the end too (unless the schedule just wrote one), so a
   ! run can always be continued from where it stopped; always when stopped
   ! for the wall time
@@ -323,8 +317,8 @@ contains
   subroutine write_background()
     integer :: u, i
     open(newunit=u, file=trim(out_dir)//'/background.dat', status='replace', action='write')
-    write(u, '(A,F10.5,A,ES12.4,A,I0,A,I0)') '# r_top_rsun ', r_top_rsun, '  c_target ', c_target, '  n_theta ', n_theta, &
-        '  yy_margin ', yy_margin
+    write(u, '(A,F10.5,A,ES12.4,A,I0,A,I0,A,F9.2,A,F9.2)') '# r_top_rsun ', r_top_rsun, '  c_target ', c_target, '  n_x ', n_x, &
+        '  n_y ', n_y, '  box_lx_mm ', box_lx_mm, '  box_ly_mm ', box_ly_mm
     write(u, '(A)') '# i  r[cm]  z[km]  dr[cm]  rho0  p0  T0  g  cs0[cm/s]  xi  s0[erg/g/K]'
     do i = 1, n_r
       write(u, '(I5,ES20.12,9ES16.7E3)') i, r_c(i), z_c(i)/1.0e5_dp, r_f(i) - r_f(i-1), rho0(i), p0(i), T0(i), g_c(i), &
@@ -334,7 +328,7 @@ contains
   end subroutine write_background
 
   ! The same blocks in a tree that allows max(refine_h, patch_level) levels
-  ! in theta and phi, then regrids until every block has its level
+  ! in x and y, then regrids until every block has its level
   ! (cz_flag_block: refine_h everywhere, patch_level in the patch)
   subroutine refine_horizontally()
     type(arbor_tree_t) :: t2
@@ -355,13 +349,13 @@ contains
       if (n_changed > 0) regridded = .true.
     end do
     call cz_setup()
-    d0 = 90.0_dp/real(n_theta - 2*merge(yy_margin, 3, yy_margin >= 0), dp)
-    write(msg, '(A,F7.4,A,I0,A,I0,A)') '  refined horizontally to ', d0/2.0_dp**refine_h, ' deg: ', &
+    d0 = box_lx_mm/real(n_x, dp)
+    write(msg, '(A,F8.3,A,I0,A,I0,A)') '  refined horizontally to ', d0/2.0_dp**refine_h, ' Mm: ', &
         tree%n_leaf, ' blocks (', n0, ' before)'
     call arbor_print(msg)
     if (patch_level > refine_h) then
-      write(msg, '(A,F7.4,A,F7.2,A,F8.2,A,F6.2,A,I0,A)') '  patch at ', d0/2.0_dp**patch_level, ' deg around lat ', &
-          patch_lat_deg, ', lon ', patch_lon_deg, ' (radius ', patch_radius_deg, ' deg): ', &
+      write(msg, '(A,F8.3,A,F8.2,A,F8.2,A,F8.2,A,I0,A)') '  patch at ', d0/2.0_dp**patch_level, ' Mm around x ', &
+          patch_x_mm, ', y ', patch_y_mm, ' Mm (radius ', patch_radius_mm, ' Mm): ', &
           count_level(patch_level), ' blocks'
       call arbor_print(msg)
     end if

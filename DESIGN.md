@@ -1,6 +1,6 @@
 # CZTR_box: a local Cartesian box of CZTR_3D
 
-Design notes, 2026-11-22. Nothing implemented yet.
+Design notes, 2026-11-22. Implemented the same day: see section 10.
 
 ## 1. Purpose
 
@@ -172,3 +172,73 @@ Open:
   (spherical, hydrostatic) is unaffected.
 - **Width vs curvature:** 1 R_sun flat is fine for a testbed; only the
   comparison with the global run's patches is approximate.
+
+## 10. Implementation status (2026-11-22)
+
+Implemented as a copy of CZTR_3D a29a414 (`cztr_box.x`; `make`, the same
+`config.mk` as CZTR_3D). Variable slots keep CZTR_3D's names: v_r, v_theta,
+v_phi hold v_z, v_x, v_y; B_r, B_theta, B_phi hold B_z, B_x, B_y.
+
+- Domain: `arbor_domain_box`, z first (the 1D grid's r as the vertical
+  coordinate), x and y uniform and periodic. Namelist: `box_lx_mm`,
+  `box_ly_mm`, `n_x`, `n_y`, `nb_x`, `nb_y` (and `nb_r`, `refine_h`, the patch
+  as `patch_x_mm`, `patch_y_mm`, `patch_radius_mm`).
+- Operators: RHS, curl, div, the time step, the Alfven cap, GLM, the column
+  solves, the radial B implicit term, the resistive face currents and the
+  atmosphere's conduction in Cartesian form; ARBOR's box metric in the flux
+  divergences.
+- Energy flux: the bottom gets F_bottom = L_bottom_Lsun L_sun/(4 pi R^2) per
+  unit box area. The 1D radial transport (grey, MLT, the cooling layer) uses
+  the sphere's relative face areas (r_f/R)^2 (`area_f`, volumes dz): its
+  physical fluxes keep the spherical L(r), so the spherical background stays
+  in balance, and the box flux area_f F is F_sun at every depth. (Without
+  this the background's radiative flux at the CZ base, 1.9 F_sun, would
+  exceed the bottom flux.) The resolved convection is not scaled: in the deep
+  CZ it carries (r/R)^2 of its spherical flux (velocities ~0.8x at the base).
+  Logs and profiles report fluxes as F/F_sun (columns still named L/Lsun).
+- Top: `wall_top = 'box'`: v_z ghosts 0.5, 0.25 x the top cell's
+  (`box_top_vz`), v_h and s1 copied, rho/rho0 copied; B by `b_bc_top`:
+  'potential' (MURaM: the ghosts the potential field of the top layer's
+  B_z, a DFT once per step, collective; use this), 'open' (zero gradient) or
+  'radial'/'conductor'. 'radial' with a potential field puts a current sheet
+  at the top (B_h != 0 there): v -> 700 km/s in 20 s in the first test.
+  b_seed_test also checks the potential ghosts on the first step: exact to
+  round-off (1e-14 G). No conductive flux through the top.
+- Seeds: `b_seed` 'uniform' (B_z), 'horizontal' (B_x w(z), the toroidal
+  analogue), 'potential' (FFT potential field of the join's B_z above the
+  join); `b_seed_test` checks 'potential' against the analytic mode-(1,1)
+  field: exact to output precision (5e-7 of 10 G) at all heights.
+- Diagnostics: area weights, x/y positions [Mm] (footpoints, max Mach, NaN,
+  probe), `region_*` output (CZTR_3D's box output), layer dumps with x, y.
+- Removed: Yin-Yang, PFSS/DPF/magnetofriction, rotation/Coriolis/L_z,
+  the synthetic EUV and continuum images (a vertical view is easy to add
+  later).
+- Fixed on the way (also in CZTR_3D): the atmosphere's ARBOR timers were
+  created lazily in atm_block, so a rank without atmosphere blocks hung in
+  the collective timer report at the end; si_radial's level check read the
+  tree's whole key array instead of its leaves.
+
+Tests (laptop, 32 x 32 columns over 696 Mm):
+- `runs_box/smoke_hd.nml` (CZ only, hydro, 100 steps, 8 ranks): clean,
+  reproducible checksum; box flux 1.0 F_sun at the bottom and top.
+- `runs_box/smoke_atm.nml` (336 cells to 73.7 Mm, atmosphere, MHD, the
+  potential test seed, step 2's heating, si_radial, 40 steps): clean; max
+  Mach 0.4 at the transition region, the top quiet. (With si_radial whole
+  columns go to ranks: 4 columns at 32^2 / 16^2 blocks; use more columns
+  than ranks.)
+
+Timing (2026-11-22, laptop, 8 ranks, runs_box/timing128.nml: 128 x 128
+columns over 696 Mm (5.4 Mm), 336 cells, 768 blocks of 28 x 16 x 16, 5.5M
+cells, step 2's physics, the potential top, 20 steps from the start):
+0.645 s/step (0.94 us per cell-step per rank), ~0.9 GB per
+rank, dt 0.435 s (the CFL of the top cells, which si_radial leaves explicit,
+and the wave cap at 2 Mm, 0.449 s). Per stage (share of the wall time): rhs
+21% (EOS 6, curls 5, Lorentz/psi 4, si_coeff 3, advection 3), diffusion 17%
+(faces B 4, EOS 4, radial B implicit 3), radial implicit solves 12% (the
+column solves 11%: mostly the transposition), ghost fills 12%, the interior
+EOS during the fills 8%, energy transport 8%, atmosphere 5% + losses during
+the fill 5%, stable_dt 4%, the potential top 2%, outputs 2.5%.
+
+Next: a hydro CZ run to a convective steady state
+(the deep CZ's thermal adjustment to the box flux), then the atmosphere and
+field; a vertical-view synthetic image.

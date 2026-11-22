@@ -1,0 +1,19 @@
+! CZTR_box smoke test: the CZ alone (cells 1..k_join of the 560 grid, the
+! photosphere top, Eddington), hydro, random s1, local time stepping as
+! CZTR_3D's runs/smoke.nml; 32 x 32 columns over 1 R_sun (21.75 Mm cells).
+!   mpirun -np 8 ./cztr_box.x runs_box/smoke_hd.nml
+&cz3d
+  grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 0
+  table_file = 'data/eos_table_wind.bin'
+  out_dir = 'output/smoke_hd'
+  wall_top = 'cell'
+  top_energy = 'eddington', grey_tau_above = 0.01, grey_top_km = 1000.0
+  use_convection = .true., mlt_switch = .true., mlt_R0 = 1.0, mlt_p = 4.0
+  rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
+  diffusion_heating = .true.
+  ds1_random = 10.0
+  box_lx_mm = 696.0, box_ly_mm = 696.0, n_x = 32, n_y = 32, nb_x = 16, nb_y = 16, nb_r = 28
+  dt1 = 60.0
+  t_end = 1.0e9, n_step_max = 100, dt_max = 1.0e4
+  n_log = 20, dt_prof = 0.0, prof_every = 100, plot_dt = 0.0, restart_dt = 0.0
+/

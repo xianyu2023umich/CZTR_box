@@ -1,6 +1,12 @@
 module cz3d_bg_mod
-  ! The 1D background, initial state and radial metric of the 3D run, by
-  ! radial cell index, taken from the merged 1D grid and a CZTR state file
+  ! The 1D background, initial state and vertical metric of the box, by
+  ! vertical cell index (the 1D grid's radius r is the box's vertical
+  ! coordinate, z = r - R: the stencils and metric dr/dxi as CZTR_3D's; the
+  ! cell volumes per unit horizontal area dr; area_f, the face areas of the
+  ! 1D radial transport only (grey, MLT, the cooling layer), the sphere's
+  ! relative areas (r_f/R)^2: the transport's physical fluxes then keep the
+  ! spherical L(r), the background stays in balance, and the energy per unit
+  ! box area it carries, area_f F, is L/(4 pi R^2) at every depth), taken from the merged 1D grid and a CZTR state file
   ! (init_full.dat format, e.g. step 1's final_init.dat) exactly as CZTR
   ! builds them (cztr_bg_mod, grid_mod):
   !   - cells -1..n_r+2 and faces 0..n_r of the 1D grid; the ghost cells are
@@ -26,8 +32,8 @@ module cz3d_bg_mod
   ! current view (n_r for the whole column).
   integer, public :: n_c = 0
   real(dp), pointer, public :: r_c(:) => null(), drdxi_c(:) => null()                  ! cells -1:n_r+2
-  real(dp), pointer, public :: r_f(:) => null(), drdxi_f(:) => null(), area_f(:) => null()   ! faces 0:n_r (area r_f^2)
-  real(dp), pointer, public :: vol_c(:) => null()                                      ! cells 1:n_r, volume per steradian
+  real(dp), pointer, public :: r_f(:) => null(), drdxi_f(:) => null(), area_f(:) => null()   ! faces 0:n_r (the transport's area (r_f/R)^2)
+  real(dp), pointer, public :: vol_c(:) => null()                                      ! cells 1:n_r, volume per unit horizontal area (dr)
   real(dp), pointer, public :: rho0(:) => null(), s0(:) => null(), T0(:) => null(), p0(:) => null(), &
       lnp0(:) => null(), g_c(:) => null(), z_c(:) => null()                            ! cells -1:n_r+2
   real(dp), pointer, public :: g_f(:) => null()                                        ! faces 0:n_r
@@ -90,9 +96,8 @@ contains
     do i = 0, n_r
       drdxi_f(i) = (r_c(i-1) - 27.0_dp*r_c(i) + 27.0_dp*r_c(i+1) - r_c(i+2))/24.0_dp
     end do
-    area_f = r_f**2
     do i = 1, n_r
-      vol_c(i) = (r_f(i)**3 - r_f(i-1)**3)/3.0_dp
+      vol_c(i) = r_f(i) - r_f(i-1)                   ! (per unit horizontal area)
     end do
 
     ! background (as cztr_bg_mod)
@@ -101,6 +106,7 @@ contains
     T0 = row(7, -1:n_r+2)
     g_c = row(8, -1:n_r+2)
     r_top_cz = r_c(1) - z_c(1)
+    area_f = (r_f/r_top_cz)**2                       ! (the radial transport's areas, see above)
     do j = -1, n_r + 2
       if (j == -1) then
         s0(j) = eos_s_from_rho_T(tab, rho0(j), T0(j), s_guess=30.0_dp*k_B/m_H)

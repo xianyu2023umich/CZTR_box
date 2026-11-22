@@ -1,151 +1,22 @@
 submodule (cz3d_app_mod) cz3d_diag_smod
-  ! diagnostics: after-step outputs, log, profiles, energy budget, probes and boxes, shell dumps, plots, checksum, the angular-momentum correction
+  ! diagnostics: after-step outputs, log, profiles, energy budget, probes and regions, layer dumps, plots, checksum.
+  ! Fluxes are reported in units of the solar surface flux F_sun = L_sun/(4 pi R^2) (the box: per unit
+  ! horizontal area; the columns named L.../Lsun hold F/F_sun, the same numbers a sphere's L/L_sun would give)
   ! (part of cz3d_app_mod: the module's data and routines by host association)
   implicit none
 
 contains
 
-  ! Longitude means in the global frame (rotation axis = global z), per radial
-  ! cell and latitude bin (n_lat_bin bins of equal latitude width): the zonal
-  ! velocity <v_phi_g>, Omega - Omega_0 = <v_phi_g>/(r cos lat) [nHz], and
-  ! the meridional velocity <v_theta_g> (> 0 southward); solid-angle weights
-  ! with the Yin-Yang overlap counted once. out_dir/rotation_NNNN.dat (the
-  ! profile's number).
-  subroutine rotation_profile(iStep, t)
-    integer, intent(in) :: iStep
-    real(dp), intent(in) :: t
-    integer, parameter :: n_lat_bin = 36
-    real(dp) :: A_IV(1:n_r, 3*n_lat_bin), e(3,3), x(3), vc(3), w, th, ph, th2, ph2, rs, lat, eph(3), eth(3), lc
-    integer :: jb, ib, i, j, k, m, u
-    character(len=300) :: name
-    A_IV = 0.0_dp
-    do jb = 1, nBlock
-      ib = iBlockList_I(jb)
-      call cz_bind(ib)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          th = Metric_DB(2, ib)%X_I(j);  ph = Metric_DB(3, ib)%X_I(k)
-          if (.not. core(th, ph)) cycle
-          w = Metric_DB(2, ib)%Vol_I(j)*Metric_DB(3, ib)%Vol_I(k)
-          call yy_angles(th, ph, th2, ph2)
-          if (core(th2, ph2)) w = 0.5_dp*w
-          e = sph_basis(th, ph)
-          x = e(:, 1)
-          if (Key_IB(KP, ib) == 2) x = yy_cart(x)
-          rs = max(hypot(x(1), x(2)), 1.0e-12_dp)
-          lat = asin(max(-1.0_dp, min(1.0_dp, x(3))))
-          m = min(n_lat_bin, 1 + int((lat + 0.5_dp*pi)/pi*n_lat_bin))
-          eph = [-x(2), x(1), 0.0_dp]/rs
-          eth = [x(3)*x(1)/rs, x(3)*x(2)/rs, -rs]
-          do i = 1, nb(1)
-            vc = matmul(e, State_GVB(i, j, k, vr_:vp_, ib))
-            if (Key_IB(KP, ib) == 2) vc = yy_cart(vc)
-            A_IV(r_off + i, m) = A_IV(r_off + i, m) + w
-            A_IV(r_off + i, n_lat_bin + m) = A_IV(r_off + i, n_lat_bin + m) + w*dot_product(vc, eph)
-            A_IV(r_off + i, 2*n_lat_bin + m) = A_IV(r_off + i, 2*n_lat_bin + m) + w*dot_product(vc, eth)
-          end do
-        end do
-      end do
-    end do
-    call cz_unbind()
-    call arbor_sum_inplace(A_IV)
-    if (.not. is_root) return
-    write(name, '(A,A,I4.4,A)') trim(out_dir), '/rotation_', i_prof, '.dat'
-    open(newunit=u, file=trim(name), status='replace', action='write')
-    write(u, '(A,ES14.6,A,I0,A,ES12.4,A)') '# t = ', t, ' s; step ', iStep, '; omega_rot = ', omega_rot, &
-        ' rad/s; longitude means in the global frame'
-    write(u, '(A)') '# i  r[cm]  z[km]  lat[deg]  <v_phi>[cm/s]  Omega-Omega0[nHz]  <v_theta>[cm/s] (>0 southward)'
-    do i = 1, n_r
-      do m = 1, n_lat_bin
-        if (A_IV(i, m) <= 0.0_dp) cycle
-        lc = -0.5_dp*pi + (m - 0.5_dp)*pi/n_lat_bin
-        write(u, '(I5,ES16.8,F12.1,F8.2,3ES14.5)') i, r_c(i), z_c(i)/1.0e5_dp, lc*180.0_dp/pi, &
-            A_IV(i, n_lat_bin + m)/A_IV(i, m), A_IV(i, n_lat_bin + m)/A_IV(i, m)/(r_c(i)*cos(lc))/(2.0_dp*pi)*1.0e9_dp, &
-            A_IV(i, 2*n_lat_bin + m)/A_IV(i, m)
-      end do
-    end do
-    close(u)
-  contains
-    logical function core(tt, pp)
-      real(dp), intent(in) :: tt, pp
-      core = tt >= 0.25_dp*pi .and. tt <= 0.75_dp*pi .and. abs(pp) <= 0.75_dp*pi
-    end function core
-  end subroutine rotation_profile
-
-  ! Remove the non-Coriolis part of L_z's change since the reference: delta_L
-  ! = L_z - (lz_ref + lz_imp), delta_Omega = delta_L / I_z (I_z = int rho s^2
-  ! dV), v -= delta_Omega z x x (global frame, back to each patch's components)
-  subroutine lz_correct(t)
-    real(dp), intent(in) :: t
-    integer :: jb, ib, i, j, k
-    real(dp) :: e(3,3), x(3), dv(3), w, th, ph, th2, ph2, lz, iz, dom
-    character(len=200) :: msg
-    if (.not. lz_ref_set) return
-    call angular_momentum(lz)
-    iz = 0.0_dp
-    do jb = 1, nBlock
-      ib = iBlockList_I(jb)
-      call cz_bind(ib)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          th = Metric_DB(2, ib)%X_I(j);  ph = Metric_DB(3, ib)%X_I(k)
-          if (.not. yy_core(th, ph)) cycle
-          w = Metric_DB(2, ib)%Vol_I(j)*Metric_DB(3, ib)%Vol_I(k)
-          call yy_angles(th, ph, th2, ph2)
-          if (yy_core(th2, ph2)) w = 0.5_dp*w
-          e = sph_basis(th, ph)
-          x = e(:, 1)
-          if (Key_IB(KP, ib) == 2) x = yy_cart(x)
-          do i = 1, nb(1)
-            iz = iz + w*Metric_DB(1, ib)%Vol_I(i)*(rho0(i) + State_GVB(i, j, k, rho1_, ib))*r_c(i)**2*(x(1)**2 + x(2)**2)
-          end do
-        end do
-      end do
-    end do
-    call cz_unbind()
-    iz = arbor_sum(iz)
-    lz_ref = lz_ref + lz_imp
-    lz_imp = 0.0_dp
-    dom = (lz - lz_ref)/iz
-    ! v -= dom (z x x) everywhere (all cells, the overlap included)
-    do jb = 1, nBlock
-      ib = iBlockList_I(jb)
-      call cz_bind(ib)
-      do k = 1, nb(3)
-        do j = 1, nb(2)
-          e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
-          do i = 1, nb(1)
-            x = r_c(i)*e(:, 1)
-            if (Key_IB(KP, ib) == 2) x = yy_cart(x)
-            dv = -dom*[-x(2), x(1), 0.0_dp]
-            if (Key_IB(KP, ib) == 2) dv = yy_cart(dv)
-            State_GVB(i, j, k, vr_:vp_, ib) = State_GVB(i, j, k, vr_:vp_, ib) + matmul(transpose(e), dv)
-          end do
-        end do
-      end do
-    end do
-    call cz_unbind()
-    if (lz_correct_dt > 0.0_dp) then
-      do while (t_next_lzc <= t)
-        t_next_lzc = t_next_lzc + lz_correct_dt
-      end do
-    end if
-    if (abs(dom) > 1.0e-3_dp*max(abs(omega_rot), 1.0e-6_dp)) then
-      write(msg, '(A,ES11.3,A)') 'cz3d: large L_z correction, delta_Omega = ', dom, ' rad/s'
-      call arbor_print(msg)
-    end if
-  end subroutine lz_correct
-
   ! Energy exchange between the flow and the field over the sphere (ghosts
   ! filled): the Lorentz force's work wl = int v.(J x B)/(4 pi) dV and the
   ! induction term's change of the magnetic energy wi = int B.curl(v x B)/(4 pi)
-  ! dV [erg/s]. With walls that pass no Poynting flux (conductor: B_r = v_r =
-  ! 0; radial: B_h = v_r = 0), wl + wi = 0 up to the discretisation: a check of
-  ! the signs and factors of both terms. Yin-Yang overlap weights as the budget's.
+  ! dV [erg/s]. With walls that pass no Poynting flux (conductor: B_z = v_z =
+  ! 0; radial: B_h = v_z = 0), wl + wi = 0 up to the discretisation: a check of
+  ! the signs and factors of both terms.
   subroutine mhd_exchange(wl, wi)
     real(dp), intent(out) :: wl, wi
     integer :: jb, ib, i, j, k
-    real(dp) :: w, th, ph, th2, ph2, v(3), b(3), jj(3), vol
+    real(dp) :: w, v(3), b(3), jj(3), vol
     wl = 0.0_dp;  wi = 0.0_dp
     do jb = 1, nBlock
       ib = iBlockList_I(jb)
@@ -164,11 +35,7 @@ contains
       call curl_block(B_GV, ib, C_CV)
       do k = 1, nb(3)
         do j = 1, nb(2)
-          th = Metric_DB(2, ib)%X_I(j);  ph = Metric_DB(3, ib)%X_I(k)
           w = Metric_DB(2, ib)%Vol_I(j)*Metric_DB(3, ib)%Vol_I(k)
-          if (.not. core(th, ph)) cycle
-          call yy_angles(th, ph, th2, ph2)
-          if (core(th2, ph2)) w = 0.5_dp*w
           do i = 1, nb(1)
             vol = w*Metric_DB(1, ib)%Vol_I(i)
             v = State_GVB(i, j, k, vr_:vp_, ib)
@@ -184,20 +51,14 @@ contains
     end do
     call cz_unbind()
     wl = arbor_sum(wl);  wi = arbor_sum(wi)
-  contains
-    logical function core(t, p)
-      real(dp), intent(in) :: t, p
-      core = t >= 0.25_dp*pi .and. t <= 0.75_dp*pi .and. abs(p) <= 0.75_dp*pi
-    end function core
   end subroutine mhd_exchange
 
-  ! h0(r) and Phi(r) of the background, the overlap weights, the shells'
+  ! h0(z) and Phi(z) of the background, the cells' horizontal areas, the layers'
   ! energy at the start, the output files. Call after cz_setup at the run's
   ! start (also after a restart: the budget counts from there).
   module subroutine budget_start(t)
     real(dp), intent(in) :: t
-    real(dp) :: th2, ph2
-    integer :: j, k, jb, ib, p
+    integer :: j, k, jb, ib
     if (dt_budget <= 0.0_dp) return
     if (rsst_h2015) call arbor_abort('cz3d: the energy budget is built for rsst_form = hotta2012')
     budget_on = .true.
@@ -206,20 +67,12 @@ contains
     work_CB = 0.0_dp
     workh_CB = 0.0_dp
     bgf_r = ddr_c(p0) + rho0(1:n_r)*g_c(1:n_r)
-    ! weight: solid angle; 1/2 where the cell centre is in both patches'
-    ! cores (theta in [pi/4, 3pi/4], phi in [-3pi/4, 3pi/4]), 0 in a margin
+    ! weight: the cell's horizontal area (dx dy)
     do jb = 1, nBlock
       ib = iBlockList_I(jb)
-      p = Key_IB(KP, ib)
       do k = 1, nb(3)
         do j = 1, nb(2)
           wyy_B(j, k, ib) = Metric_DB(2, ib)%Vol_I(j)*Metric_DB(3, ib)%Vol_I(k)
-          if (.not. in_core(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))) then
-            wyy_B(j, k, ib) = 0.0_dp
-          else
-            call yy_angles(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k), th2, ph2)
-            if (in_core(th2, ph2)) wyy_B(j, k, ib) = 0.5_dp*wyy_B(j, k, ib)
-          end if
         end do
       end do
     end do
@@ -243,7 +96,7 @@ contains
           'dE_total-(sum of operators)  W_background_force  E_rsst_source_fluct   (the RSST source and the ' // &
           'background-force work are part of dE_hydro)'
       open(newunit=u_bsum, file=trim(out_dir)//'/budget_log.txt', status='replace', action='write')
-      write(u_bsum, '(A,ES16.8,A)') '# energy budget of the whole domain since t0 = ', t, ' s, as mean rates in Lsun:'
+      write(u_bsum, '(A,ES16.8,A)') '# energy budget of the whole domain since t0 = ', t, ' s, as mean rates in F_sun x box area:'
       write(u_bsum, '(A)') '# step  t  dE_total/dt  hydro  radiation  cooling  diffusion  rsst_source  residual  ' // &
           'bg_force_work  rsst_fluct  hydro-rsst-bg_work (scheme error)'
       open(newunit=u_bkh, file=trim(out_dir)//'/budget_kh.dat', status='replace', action='write')
@@ -256,11 +109,6 @@ contains
           'L_res_kin(c)   (dE_th = rho T ds + (h + Phi) drho; W = -v.grad p1 - g rho1 v_r; L_res at the cell centre: ' // &
           'rho v_r (h + v^2/2 + Phi) and rho v_r v^2/2 over the sphere; see scripts/analyze_split.py)'
     end if
-  contains
-    logical function in_core(th, ph)
-      real(dp), intent(in) :: th, ph
-      in_core = th >= 0.25_dp*pi .and. th <= 0.75_dp*pi .and. abs(ph) <= 0.75_dp*pi
-    end function in_core
   end subroutine budget_start
 
   ! E per shell (e from the EOS core at the cell's rho, T)
@@ -323,12 +171,12 @@ contains
               + (h_o + phi_r(i))*(rho_n - rho_o))
           acc_IV(i, 10) = acc_IV(i, 10) + vol*dt*work_CB(i, j, k, ib)
           acc_IV(i, 11) = acc_IV(i, 11) - vol*(xi(i)**2 - 1.0_dp)*ke_o*(rho_n - rho_o)
-          acc_IV(i, 12) = acc_IV(i, 12) + w*dt*r_c(i)**2*rho_o*StateOld_GVB(i, j, k, vr_, ib)*(h_o + ke_o + phi_r(i))
-          acc_IV(i, 13) = acc_IV(i, 13) + w*dt*r_c(i)**2*rho_o*StateOld_GVB(i, j, k, vr_, ib)*ke_o
+          acc_IV(i, 12) = acc_IV(i, 12) + w*dt*rho_o*StateOld_GVB(i, j, k, vr_, ib)*(h_o + ke_o + phi_r(i))
+          acc_IV(i, 13) = acc_IV(i, 13) + w*dt*rho_o*StateOld_GVB(i, j, k, vr_, ib)*ke_o
           acc_IV(i, 14) = acc_IV(i, 14) + vol*0.5_dp*(rho_n*sum(State_GVB(i, j, k, vt_:vp_, ib)**2) &
               - rho_o*sum(StateOld_GVB(i, j, k, vt_:vp_, ib)**2))
           acc_IV(i, 15) = acc_IV(i, 15) + vol*dt*workh_CB(i, j, k, ib)
-          acc_IV(i, 16) = acc_IV(i, 16) + w*dt*r_c(i)**2*rho_o*StateOld_GVB(i, j, k, vr_, ib) &
+          acc_IV(i, 16) = acc_IV(i, 16) + w*dt*rho_o*StateOld_GVB(i, j, k, vr_, ib) &
               *0.5_dp*sum(StateOld_GVB(i, j, k, vt_:vp_, ib)**2)
         end do
       end do
@@ -354,7 +202,7 @@ contains
     end do
     write(u_bud, '(A)') ''
     flush(u_bud)
-    f = 1.0_dp/(max(t - t_bud0, 1.0e-30_dp)*Lsun)
+    f = 1.0_dp/(max(t - t_bud0, 1.0e-30_dp)*f_sun()*box_area())
     write(u_bsum, '(I9,ES16.8,10F12.5)') iStep, t, sum(dE)*f, (sum(A_IV(:, i))*f, i = 1, 5), &
         (sum(dE) - sum(A_IV(:, 1:4)))*f, sum(A_IV(:, 6))*f, sum(A_IV(:, 7))*f, &
         (sum(A_IV(:, 1)) - sum(A_IV(:, 5)) - sum(A_IV(:, 6)))*f
@@ -380,26 +228,11 @@ contains
     integer, intent(in) :: iStep
     real(dp), intent(in) :: t
     call tic(T_AFTER)
-    if (probe_radius_deg > 0.0_dp) call probe_write(iStep, t)
-    if (box_radius_deg > 0.0_dp .and. box_every > 0) then
-      if (mod(iStep, box_every) == 0) call box_write(iStep, t)
-    end if
-    if (euv_dt > 0.0_dp) then
-      if (t_next_euv == -huge(1.0_dp)) t_next_euv = t
-      if (t >= t_next_euv) then
-        call euv_write(iStep, t)
-        do while (t_next_euv <= t)
-          t_next_euv = t_next_euv + euv_dt
-        end do
-      end if
+    if (probe_radius_mm > 0.0_dp) call probe_write(iStep, t)
+    if (region_radius_mm > 0.0_dp .and. region_every > 0) then
+      if (mod(iStep, region_every) == 0) call region_write(iStep, t)
     end if
     call nan_check(iStep, t)
-    if (lz_correct_steps > 0 .or. lz_correct_dt > 0.0_dp) then
-      if (lz_correct_steps > 0) then
-        if (mod(iStep, lz_correct_steps) == 0) call lz_correct(t)
-      end if
-      if (lz_correct_dt > 0.0_dp .and. t >= t_next_lzc) call lz_correct(t)
-    end if
     if (mod(iStep, n_log) == 0 .or. t >= t_end*(1.0_dp - 1.0e-12_dp)) then
       call cz_log(iStep, t)
       call dt_report(iStep)
@@ -424,7 +257,7 @@ contains
     integer :: c, r, rmin
     character(len=240) :: msg
     character(len=*), parameter :: nm(3) = ['CFL sum  ', 'wave cap ', 'losses   ']
-    character(len=*), parameter :: dn(3) = ['radial', 'theta ', 'phi   ']
+    character(len=*), parameter :: dn(3) = ['z     ', 'x     ', 'y     ']
     write(msg, '(A,I0,A)') 'dt limits (step ', iStep, '):'
     call arbor_print(msg)
     do c = 1, 3
@@ -437,7 +270,7 @@ contains
       v = arbor_sum(v)
       if (c == 1) then
         write(msg, '(4X,A,F8.4,A,I4,A,F10.1,A,F7.1,A,F7.1,A,F7.1,A,F7.1,A,A)') nm(c), g, ' s  cell ', nint(v(2)), &
-            ' (z ', v(3), ' km, dr ', v(8), ' km): |v_r| ', v(4)/1.0e5_dp, ', radial wave ', v(5)/1.0e5_dp, &
+            ' (z ', v(3), ' km, dz ', v(8), ' km): |v_z| ', v(4)/1.0e5_dp, ', vertical wave ', v(5)/1.0e5_dp, &
             ', horizontal fast ', v(6)/1.0e5_dp, ' km/s; dominant ', trim(dn(nint(v(7))))
       else if (c == 2) then
         write(msg, '(4X,A,F8.4,A,I4,A,F10.1,A,F7.1,A,F7.1,A)') nm(c), g, ' s  cell ', nint(v(2)), ' (z ', v(3), &
@@ -460,7 +293,7 @@ contains
     real(dp) :: x(n_tim + 2), mn, mean, mx
     integer :: k, kk
     ! the print order: the diffusion's parts after it
-    integer, parameter :: order(n_tim + 2) = [T_ADV, T_GHOST, T_G_RK, T_G_ATM, T_G_DIF, T_G_JOIN, T_R_OVL, T_RHS, T_R_EOS, T_R_MASS, T_R_ADV, T_R_PRS, T_R_MCURL, T_R_MLOOP, T_R_SIC, T_R_UPD, T_SI, T_S_SOL, T_TRANS, T_G_TR, T_ATM, T_A_OVL, T_DIFF, T_D_SIP, T_D_ETA, T_G_ETA, T_D_PRE, &
+    integer, parameter :: order(n_tim + 2) = [T_ADV, T_TOPB, T_GHOST, T_G_RK, T_G_ATM, T_G_DIF, T_G_JOIN, T_R_OVL, T_RHS, T_R_EOS, T_R_MASS, T_R_ADV, T_R_PRS, T_R_MCURL, T_R_MLOOP, T_R_SIC, T_R_UPD, T_SI, T_S_SOL, T_TRANS, T_G_TR, T_ATM, T_A_OVL, T_DIFF, T_D_SIP, T_D_ETA, T_G_ETA, T_D_PRE, &
         T_D_EOS, T_D_FA, T_D_FB, T_D_FR, T_D_FE, T_D_DIV, T_D_UPD, T_D_IMP, n_tim + 1, T_DT, T_AFTER, n_tim + 2]
     character(len=200) :: msg
     character(len=24) :: lab
@@ -513,11 +346,11 @@ contains
     write(msg, '(A,ES9.2,A,ES9.2,A,ES9.2,A,ES9.2,A)') 'floors: rho_floor ', rho_floor, ' g/cm3 acted in ', &
         sum(c(2, :)), ' of ', sum(c(1, :)), ' cell-calls; T_floor ', T_floor, ' K:'
     call arbor_print(msg)
-    ! the T floor's mean power over the run, as a flux through the photosphere (4 pi R^2)
+    ! the T floor's mean power over the run, as a flux through the box's area
     if (dt_run > 0.0_dp) then
       write(msg, '(A,ES10.3,A,ES10.3,A,F8.1,A)') '    T floor: energy added ', sum(c(4, :)), ' erg, mean power ', &
-          sum(c(4, :))/dt_run, ' erg/s = ', sum(c(4, :))/dt_run/(4.0_dp*pi*r_f(k_join)**2)/1.0e3_dp, &
-          ' x 1e3 erg/cm2/s over the sphere (Yin-Yang overlap counted twice, ~+6%)'
+          sum(c(4, :))/dt_run, ' erg/s = ', sum(c(4, :))/dt_run/box_area()/1.0e3_dp, &
+          ' x 1e3 erg/cm2/s over the box'
       call arbor_print(msg)
     end if
     ! for comparison: the radiative losses and the heating (the last step's
@@ -547,8 +380,8 @@ contains
         call cz_unbind()
       end if
       call arbor_sum_inplace(ql)
-      write(msg, '(A,F8.1,A,F8.1,A)') '    z 0-1200 km, last step: losses ', ql(1)/(4.0_dp*pi*r_f(k_join)**2)/1.0e3_dp, &
-          ', heating ', ql(2)/(4.0_dp*pi*r_f(k_join)**2)/1.0e3_dp, ' x 1e3 erg/cm2/s over the sphere'
+      write(msg, '(A,F8.1,A,F8.1,A)') '    z 0-1200 km, last step: losses ', ql(1)/box_area()/1.0e3_dp, &
+          ', heating ', ql(2)/box_area()/1.0e3_dp, ' x 1e3 erg/cm2/s over the box'
       call arbor_print(msg)
       call arbor_sum_inplace(qs)
       call arbor_print('    per shell (z km: losses, T-floor power, x 1e3 erg/cm2/s):')
@@ -560,7 +393,7 @@ contains
           msg = '     '
         end if
         write(msg(len_trim(msg)+1:), '(1X,I0,A,F0.0,A,F0.0)') nint(z_c(i)/1.0e5_dp), ': ', &
-            qs(i)/(4.0_dp*pi*r_f(k_join)**2)/1.0e3_dp, '/', c(4, i)/dt_run/(4.0_dp*pi*r_f(k_join)**2)/1.0e3_dp
+            qs(i)/box_area()/1.0e3_dp, '/', c(4, i)/dt_run/box_area()/1.0e3_dp
       end do
       call arbor_print(msg)
     end block
@@ -601,13 +434,12 @@ contains
   ! z = 1 Mm relative to that shell's mean (a drained chromosphere), the
   ! strongest downflow at z = 0.5-3 Mm (a siphon or drainage into a
   ! footpoint) and the largest Mach number at z = 0-3 Mm, each with its place
-  ! (global latitude, longitude; z and T for the last two). The means count
-  ! the cells of both Yin-Yang patches (the overlap twice).
+  ! (x, y [Mm]; z and T for the last two).
   subroutine footpoint_report(iStep, t)
     integer, intent(in) :: iStep
     real(dp), intent(in) :: t
     integer, save :: u = 0, i1 = 0
-    real(dp) :: out(n_field), rho, cs, p, zk, m, x(3), e(3,3), lat, lon, h
+    real(dp) :: out(n_field), rho, cs, p, zk, m, lat, lon, h
     real(dp) :: psum, pn, pmin, vmin, mmax, gp, gv, gm
     real(dp) :: lp(2), lv(4), lm(4)
     integer :: jb, ib, i, j, k, ig
@@ -628,11 +460,8 @@ contains
             p = exp(out(F_LNP))
             cs = sqrt(out(F_GAMMA1)*p/rho)
             m = norm2(State_GVB(i, j, k, vr_:vp_, ib))/cs
-            e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
-            x = e(:, 1)
-            if (Key_IB(KP, ib) == 2) x = yy_cart(x)
-            lat = asin(max(-1.0_dp, min(1.0_dp, x(3))))*180.0_dp/pi
-            lon = atan2(x(2), x(1))*180.0_dp/pi
+            lat = Metric_DB(2, ib)%X_I(j)/1.0e8_dp            ! (x, y [Mm] in the lat, lon slots)
+            lon = Metric_DB(3, ib)%X_I(k)/1.0e8_dp
             if (ig == i1) then
               psum = psum + p;  pn = pn + 1.0_dp
               if (p < pmin) then
@@ -671,59 +500,55 @@ contains
     if (.not. is_root) return
     if (u == 0) then
       open(newunit=u, file=trim(out_dir)//'/footpoints.txt', status='unknown', position='append', action='write')
-      write(u, '(A,F8.1,A)') '# step  t[s]  p_min/<p> at z = ', z_c(i1)/1.0e5_dp, ' km, lat, lon | min v_r [km/s] at' // &
-          ' z = 0.5-3 Mm, lat, lon, z[km], T | max Mach at z = 0-3 Mm, lat, lon, z[km], T'
+      write(u, '(A,F8.1,A)') '# step  t[s]  p_min/<p> at z = ', z_c(i1)/1.0e5_dp, ' km, x, y [Mm] | min v_z [km/s] at' // &
+          ' z = 0.5-3 Mm, x, y, z[km], T | max Mach at z = 0-3 Mm, x, y, z[km], T'
     end if
     write(u, '(I9,ES14.6,ES11.3,2F8.2,ES11.3,2F8.2,F9.1,ES10.2,ES11.3,2F8.2,F9.1,ES10.2)') iStep, t, &
         gp/max(psum/max(pn, 1.0_dp), tiny(1.0_dp)), lp, gv/1.0e5_dp, lv, gm, lm
     flush(u)
   end subroutine footpoint_report
 
-  subroutine box_write(iStep, t)
+  ! Region output (region_radius_mm > 0): every region_every steps, the cells
+  ! within region_radius_mm of (region_x_mm, region_y_mm) (periodic distance)
+  ! with z in region_z_km, one file per rank (out_dir/region_rNNNN.dat)
+  subroutine region_write(iStep, t)
     use cztr3d_atm_mod, only: Qloss_B, Qheat_B
     integer, intent(in) :: iStep
     real(dp), intent(in) :: t
     integer, save :: u = 0
-    real(dp) :: x0(3), x(3), e(3,3), la, lo, out(n_field), rho, cs, Tc, p, b(3), v(3), b2, qh, ql, zz
+    real(dp) :: out(n_field), rho, cs, Tc, p, b(3), v(3), b2, qh, ql, zz, x, y
     integer :: jb, ib, i, j, k
     character(len=300) :: name
-    la = box_lat_deg*pi/180.0_dp;  lo = box_lon_deg*pi/180.0_dp
-    x0 = [cos(la)*cos(lo), cos(la)*sin(lo), sin(la)]
     do jb = 1, nBlock
       ib = iBlockList_I(jb)
       call cz_bind(ib)
-      if (z_c(nb(1)) < box_z_km(1)*1.0e5_dp .or. z_c(1) > box_z_km(2)*1.0e5_dp) cycle
+      if (z_c(nb(1)) < region_z_km(1)*1.0e5_dp .or. z_c(1) > region_z_km(2)*1.0e5_dp) cycle
       do k = 1, nb(3)
         do j = 1, nb(2)
-          e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
-          x = e(:, 1)
-          if (Key_IB(KP, ib) == 2) x = yy_cart(x)
-          if (dot_product(x, x0) < cos(box_radius_deg*pi/180.0_dp)) cycle
+          x = Metric_DB(2, ib)%X_I(j)
+          y = Metric_DB(3, ib)%X_I(k)
+          if (box_dist2(x, y, region_x_mm, region_y_mm) > (region_radius_mm*1.0e8_dp)**2) cycle
           if (u == 0) then
-            write(name, '(A,A,I4.4,A)') trim(out_dir), '/box_r', my_rank, '.dat'
+            write(name, '(A,A,I4.4,A)') trim(out_dir), '/region_r', my_rank, '.dat'
             open(newunit=u, file=trim(name), status='replace', action='write')
-            write(u, '(A)') '# step t[s] cell z[km] lat lon patch rho[g/cm3] T[K] vx vy vz[cm/s] Bx By Bz[G] (global Cartesian) ' // &
+            write(u, '(A)') '# step t[s] cell z[km] x[Mm] y[Mm] rho[g/cm3] T[K] vx vy vz[cm/s] Bx By Bz[G] ' // &
                 'beta Mach Q_heat Q_loss[erg/cm3/s]'
           end if
           do i = 1, nb(1)
             zz = z_c(i)/1.0e5_dp
-            if (zz < box_z_km(1) .or. zz > box_z_km(2)) cycle
+            if (zz < region_z_km(1) .or. zz > region_z_km(2)) cycle
             rho = rho0(i) + rq(i)*State_GVB(i, j, k, rho1_, ib)
             call eos_eval(tab, rho, s0(i) + State_GVB(i, j, k, s1_, ib), out)
             Tc = exp(out(F_LNT));  p = exp(out(F_LNP));  cs = sqrt(out(F_GAMMA1)*p/rho)
-            v = matmul(e, State_GVB(i, j, k, vr_:vp_, ib))
+            v = [State_GVB(i, j, k, vt_, ib), State_GVB(i, j, k, vp_, ib), State_GVB(i, j, k, vr_, ib)]
             b = 0.0_dp
-            if (use_B) b = matmul(e, State_GVB(i, j, k, br_:bp_, ib))
-            if (Key_IB(KP, ib) == 2) then
-              v = yy_cart(v);  b = yy_cart(b)
-            end if
+            if (use_B) b = [State_GVB(i, j, k, bt_, ib), State_GVB(i, j, k, bp_, ib), State_GVB(i, j, k, br_, ib)]
             b2 = sum(b**2)
             qh = 0.0_dp;  ql = 0.0_dp
             if (allocated(Qheat_B) .and. r_off + i > k_join) then
               qh = Qheat_B(i, j, k, ib);  ql = Qloss_B(i, j, k, ib)
             end if
-            write(u, '(I9,ES15.7,I5,F11.1,2F9.3,I2,14ES12.4)') iStep, t, r_off + i, zz, &
-                asin(max(-1.0_dp, min(1.0_dp, x(3))))*180.0_dp/pi, atan2(x(2), x(1))*180.0_dp/pi, Key_IB(KP, ib), &
+            write(u, '(I9,ES15.7,I5,F11.1,2F10.3,14ES12.4)') iStep, t, r_off + i, zz, x/1.0e8_dp, y/1.0e8_dp, &
                 rho, Tc, v, b, p/max(b2/(8.0_dp*pi), tiny(1.0_dp)), norm2(v)/cs, qh, ql
           end do
         end do
@@ -731,41 +556,57 @@ contains
     end do
     call cz_unbind()
     if (u /= 0) flush(u)
-  end subroutine box_write
+  end subroutine region_write
 
-  ! Debugging probe (probe_radius_deg > 0): the top probe_cells cells of the
-  ! columns near (probe_lat_deg, probe_lon_deg), every step, one file per rank:
-  ! step t i patch level j k lat lon rho1/rho0 s1 v_r v_theta v_phi T c_s Mach
+  ! The squared periodic distance [cm^2] of (x, y) [cm] from (x0, y0) [Mm]
+  pure real(dp) function box_dist2(x, y, x0_mm, y0_mm) result(d2)
+    real(dp), intent(in) :: x, y, x0_mm, y0_mm
+    real(dp) :: dx, dy, lx, ly
+    lx = box_lx_mm*1.0e8_dp;  ly = box_ly_mm*1.0e8_dp
+    dx = x - x0_mm*1.0e8_dp;  dy = y - y0_mm*1.0e8_dp
+    dx = dx - lx*anint(dx/lx);  dy = dy - ly*anint(dy/ly)
+    d2 = dx**2 + dy**2
+  end function box_dist2
+
+  ! The solar surface flux L_sun/(4 pi R^2) [erg/cm^2/s] (the flux unit of the reports)
+  real(dp) function f_sun()
+    f_sun = Lsun/(4.0_dp*pi*r_top_cz**2)
+  end function f_sun
+
+  ! The box's horizontal area [cm^2]
+  real(dp) function box_area()
+    box_area = box_lx_mm*box_ly_mm*1.0e16_dp
+  end function box_area
+
+  ! Debugging probe (probe_radius_mm > 0): the top probe_cells cells of the
+  ! columns near (probe_x_mm, probe_y_mm), every step, one file per rank:
+  ! step t i patch level j k x y [Mm] rho1/rho0 s1 v_z v_x v_y T c_s Mach
   subroutine probe_write(iStep, t)
     integer, intent(in) :: iStep
     real(dp), intent(in) :: t
     integer, save :: u = 0
-    real(dp) :: x0(3), x(3), e(3,3), la, lo, out(n_field), rho, cs, Tc
+    real(dp) :: out(n_field), rho, cs, Tc
     integer :: jb, ib, i, j, k
     character(len=300) :: name
-    la = probe_lat_deg*pi/180.0_dp;  lo = probe_lon_deg*pi/180.0_dp
-    x0 = [cos(la)*cos(lo), cos(la)*sin(lo), sin(la)]
     do jb = 1, nBlock
       ib = iBlockList_I(jb)
       if (.not. arbor_physical_side(ib, 1, 2)) cycle          ! top blocks only
       call cz_bind(ib)
       do k = 1, nb(3)
         do j = 1, nb(2)
-          e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
-          x = e(:, 1)
-          if (Key_IB(KP, ib) == 2) x = yy_cart(x)
-          if (dot_product(x, x0) < cos(probe_radius_deg*pi/180.0_dp)) cycle
+          if (box_dist2(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k), probe_x_mm, probe_y_mm) &
+              > (probe_radius_mm*1.0e8_dp)**2) cycle
           if (u == 0) then
             write(name, '(A,A,I4.4,A)') trim(out_dir), '/probe_r', my_rank, '.dat'
             open(newunit=u, file=trim(name), status='replace', action='write')
-            write(u, '(A)') '# step t i patch level j k lat lon rho1/rho0 s1 v_r v_theta v_phi T c_s Mach'
+            write(u, '(A)') '# step t i patch level j k x y rho1/rho0 s1 v_z v_x v_y T c_s Mach'
           end if
           do i = max(1, nb(1) - probe_cells + 1), nb(1)
             rho = rho0(i) + rq(i)*State_GVB(i, j, k, rho1_, ib)
             call eos_eval(tab, rho, s0(i) + State_GVB(i, j, k, s1_, ib), out)
             Tc = exp(out(F_LNT));  cs = sqrt(out(F_GAMMA1)*exp(out(F_LNP))/rho)
             write(u, '(I9,ES15.7,I5,4I3,2F9.3,9ES14.5)') iStep, t, r_off + i, Key_IB(KP, ib), Key_IB(KL+2, ib), j, k, &
-                asin(max(-1.0_dp, min(1.0_dp, x(3))))*180.0_dp/pi, atan2(x(2), x(1))*180.0_dp/pi, &
+                Metric_DB(2, ib)%X_I(j)/1.0e8_dp, Metric_DB(3, ib)%X_I(k)/1.0e8_dp, &
                 State_GVB(i, j, k, rho1_, ib)/rho0(i), State_GVB(i, j, k, s1_, ib), State_GVB(i, j, k, vr_:vp_, ib), &
                 Tc, cs, norm2(State_GVB(i, j, k, vr_:vp_, ib))/cs
           end do
@@ -782,7 +623,6 @@ contains
     real(dp), intent(in) :: t
     logical :: bad
     integer :: jb, ib, i, j, k, v
-    real(dp) :: e(3,3), x(3)
     character(len=300) :: msg
     bad = .false.
     do jb = 1, nBlock
@@ -800,12 +640,9 @@ contains
           end do
         end do
       end do cells
-      e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
-      x = e(:, 1)
-      if (Key_IB(KP, ib) == 2) x = yy_cart(x)
-      write(msg, '(A,I0,A,I0,A,F9.1,A,F7.2,A,F8.2,A,I0,A,I0,A,2I4)') 'cz3d: NaN on rank ', my_rank, ': cell ', r_off + i, &
-          ' (z ', z_c(i)/1.0e5_dp, ' km), lat ', asin(max(-1.0_dp, min(1.0_dp, x(3))))*180.0_dp/pi, ', lon ', &
-          atan2(x(2), x(1))*180.0_dp/pi, ', patch ', Key_IB(KP, ib), ', level ', Key_IB(KL+2, ib), ', j k in block', j, k
+      write(msg, '(A,I0,A,I0,A,F9.1,A,F9.2,A,F9.2,A,I0,A,2I4)') 'cztr_box: NaN on rank ', my_rank, ': cell ', r_off + i, &
+          ' (z ', z_c(i)/1.0e5_dp, ' km), x ', Metric_DB(2, ib)%X_I(min(j, nb(2)))/1.0e8_dp, ' Mm, y ', &
+          Metric_DB(3, ib)%X_I(min(k, nb(3)))/1.0e8_dp, ' Mm, level ', Key_IB(KL+2, ib), ', j k in block', j, k
       write(0, '(A)') trim(msg)
       call cz_unbind()
     end do
@@ -814,9 +651,8 @@ contains
     call arbor_abort('cz3d: NaN in the state')
   end subroutine nan_check
 
-  ! Horizontal sums per radial cell (weighted by solid angle; the Yin-Yang
-  ! overlap counts twice, which does not matter for means of a uniform
-  ! state): returns Sum_IV(i, v) for v = 1 weight, 2 rho1, 3 (rho1 - <rho1>)^2,
+  ! Horizontal sums per vertical cell (weighted by the cells' horizontal
+  ! area): returns Sum_IV(i, v) for v = 1 weight, 2 rho1, 3 (rho1 - <rho1>)^2,
   ! 4 s1, 5 (s1 - <s1>)^2, 6 v_r, 7 v_r^2, 8 v_h^2, 9 T, 10 L_rad and
   ! 11 L_conv at face i, 12 rho v_r h1, 13 rho v_r, 14 h1 (h1 = T s1 + p1/rho,
   ! the enthalpy perturbation to first order), 15 rho v^2 v_r / 2
@@ -916,7 +752,7 @@ contains
     integer, intent(in) :: iStep
     real(dp), intent(in) :: t
     real(dp) :: S(0:n_r, 19), L(0:n_r), Lres(1:n_r), mach, mach_r, dmin, vrmax, vhmax, cs, ds_h, dr_h, out(n_field), rho
-    real(dp) :: bmax, emag, ekin, eratio, divb_rel, sd, sb, dxm, wl, wi, lz, tcor, vamax, n_cap, n_all, trmin, trmax
+    real(dp) :: bmax, emag, ekin, eratio, divb_rel, sd, sb, dxm, wl, wi, lz, tcor, vamax, n_cap, n_all, trmin, trmax, fa
     integer :: nt                                   ! the top of the CZ (L_top, the L range): the join with the atmosphere
     integer :: jb, ib, i, j, k
     character(len=300) :: line
@@ -951,7 +787,7 @@ contains
     mach = arbor_max(mach);  mach_r = arbor_max(mach_r);  dmin = arbor_min(dmin);  vrmax = arbor_max(vrmax);  vhmax = arbor_max(vhmax)
     bmax = arbor_max(bmax);  vamax = arbor_max(vamax);  n_cap = arbor_sum(n_cap);  n_all = arbor_sum(n_all)
     nt = merge(k_join, n_r, use_atmosphere)
-    call angular_momentum(lz, tcor)
+    lz = 0.0_dp;  tcor = 0.0_dp                     ! (no rotation in the box: the columns kept, 0)
     ! the transition region's height range (T = 1e5 K crossings below 10 Mm; -1 without)
     trmin = huge(1.0_dp);  trmax = -huge(1.0_dp)
     if (use_atmosphere) then
@@ -976,7 +812,7 @@ contains
         do k = 1, nb(3)
           do j = 1, nb(2)
             do i = 1, nb(1)
-              dxm = min(drdxi_c(i), r_c(i)*Metric_DB(2, ib)%Dx_I(j), r_c(i)*sin(Metric_DB(2, ib)%X_I(j))*Metric_DB(3, ib)%Dx_I(k))
+              dxm = min(drdxi_c(i), Metric_DB(2, ib)%Dx_I(j), Metric_DB(3, ib)%Dx_I(k))
               sd = sd + (divB_C(i, j, k)*dxm)**2
               sb = sb + sum(State_GVB(i, j, k, br_:bp_, ib)**2)
             end do
@@ -996,8 +832,9 @@ contains
       ekin = ekin + vol_c(i)*0.5_dp*rho0(i)*(S(i, 7) + S(i, 8))/S(i, 1)
     end do
     eratio = emag/max(ekin, tiny(1.0_dp))
-    ! radiation, MLT, diffusion and the cooling layer at the faces
-    L = 4.0_dp*pi*area_f*(S(:, 10) + S(:, 11) + S(:, 16) + S(0, 1)*cool_f)/S(0, 1)/Lsun
+    ! radiation, MLT, diffusion and the cooling layer at the faces (F/F_sun)
+    L = (area_f*(S(:, 10) + S(:, 11) + S(0, 1)*cool_f) + S(:, 16))/S(0, 1)/f_sun()   ! (transport: area_f F)
+    fa = f_sun()*box_area()                              ! (the exchange rates in F_sun x box area)
     call resolved_L(S, Lres)
     ds_h = 0.0_dp;  dr_h = 0.0_dp
     do i = 1, n_r
@@ -1011,6 +848,8 @@ contains
       wall0 = arbor_wtime()
     else if (u_log == 0) then
       open(newunit=u_log, file=trim(out_dir)//'/log.txt', status='replace', action='write')
+      write(u_log, '(A)') '# CZTR_box: the L columns hold F/F_sun (F_sun = L_sun/(4 pi R^2)); W_Lorentz, dE_mag/dt in ' // &
+          'F_sun x box area; L_z, T_Coriolis 0 (no rotation)'
       write(u_log, '(A)') '# step  t[s]  dt[s]  max_Mach  max|v_r|  max|v_h| [cm/s]  L_top/Lsun  min_L  max_L  ' // &
           'max_rms_h(s1)[erg/g/K]  max_rms_h(rho1)/rho0  wall[s]  max_Mach(reduced c_s)  ' // &
           'max|L_enth+L_kin|  min_L_total  max_L_total   (L_total = L_rad + L_conv + L_diff + L_cool + L_enth + L_kin)' // &
@@ -1025,7 +864,7 @@ contains
     write(u_log, '(I9,ES14.6,ES11.3,3ES11.3,3F10.5,2ES11.3,F10.1,ES11.3,3F10.5,ES11.3,F9.3,2ES14.6,3ES11.3,2ES12.4,2ES14.6,2ES11.3,2F10.1)') iStep, t, &
         dt_last, mach, vrmax, vhmax, L(nt), minval(L(1:nt-1)), maxval(L(1:nt-1)), ds_h, dr_h, arbor_wtime() - wall0, &
         mach_r, maxval(abs(Lres(1:nt))), minval(L(1:nt-1) + Lres(1:nt-1)), maxval(L(1:nt-1) + Lres(1:nt-1)), dmin, maxval(tsc), &
-        tloc(1), tloc(n_r/2), bmax, eratio, divb_rel, wl/Lsun, wi/Lsun, lz, tcor, vamax, n_cap/max(n_all, 1.0_dp), trmin, trmax
+        tloc(1), tloc(n_r/2), bmax, eratio, divb_rel, wl/fa, wi/fa, lz, tcor, vamax, n_cap/max(n_all, 1.0_dp), trmin, trmax
     flush(u_log)
     write(line, '(A,I8,A,ES11.4,A,ES9.2,A,ES9.2,A,ES9.2,A,ES9.2,A,ES9.2,A,F8.5,A,F8.5,A,F8.5,A,ES9.2)') 'step ', iStep, &
         ' t=', t, ' dt=', dt_last, ' Mach=', mach, ' (red. ', mach_r, ') |vr|=', vrmax, ' |vh|=', vhmax, ' L_top=', &
@@ -1042,14 +881,13 @@ contains
     character(len=300) :: name
     call horizontal_sums(S, .true.)
     write(name, '(A,A,I4.4,A)') trim(out_dir), '/profile_', i_prof, '.dat'
-    call write_profile(S, name, 'horizontal means (solid-angle weighted) and rms deviations')
+    call write_profile(S, name, 'horizontal means (area weighted) and rms deviations; L columns: F/F_sun')
     if (patch_level > refine_h) then
       ! the same over the refined patch alone (its finest blocks)
       call horizontal_sums(S, .true., patch_level)
       write(name, '(A,A,I4.4,A)') trim(out_dir), '/profile_patch_', i_prof, '.dat'
       call write_profile(S, name, 'means over the refined patch (blocks of level patch_level) and rms deviations')
     end if
-    if (omega_rot /= 0.0_dp) call rotation_profile(iStep, t)
     i_prof = i_prof + 1
     t_next_prof = t_prof0 + i_prof*dt_prof
   contains
@@ -1072,16 +910,16 @@ contains
         m = S(i, 4)/w
         write(u, '(I5,ES20.12,20ES16.7E3)') i, r_c(i), z_c(i)/1.0e5_dp, rho0(i) + rq(i)*S(i, 2)/w, S(i, 9)/w, m, &
             sqrt(S(i, 5)/w), S(i, 6)/w, sqrt(S(i, 7)/w), sqrt(S(i, 8)/w), &
-            4.0_dp*pi*area_f(i)*S(i, 10)/S(0, 1)/Lsun, 4.0_dp*pi*area_f(i)*S(i, 11)/S(0, 1)/Lsun, Lres(i), &
-            4.0_dp*pi*r_c(i)**2*S(i, 15)/w/Lsun, 4.0_dp*pi*area_f(i)*S(i, 16)/S(0, 1)/Lsun, &
-            4.0_dp*pi*area_f(i)*cool_f(i)/Lsun, tloc(i), tsc(i), S(i, 13)/w, S(i, 17)/w, sqrt(S(i, 18)/w), sqrt(S(i, 19)/w)
+            area_f(i)*S(i, 10)/S(0, 1)/f_sun(), area_f(i)*S(i, 11)/S(0, 1)/f_sun(), Lres(i), &
+            S(i, 15)/w/f_sun(), S(i, 16)/S(0, 1)/f_sun(), &
+            area_f(i)*cool_f(i)/f_sun(), tloc(i), tsc(i), S(i, 13)/w, S(i, 17)/w, sqrt(S(i, 18)/w), sqrt(S(i, 19)/w)
       end do
       close(u)
     end subroutine write_profile
   end subroutine cz_profile
 
-  ! Resolved luminosity at the cell centres: 4 pi r^2 (<rho v_r h1> -
-  ! <rho v_r><h1> + <rho v^2 v_r/2>), in Lsun
+  ! Resolved flux at the cell centres: <rho v_z h1> - <rho v_z><h1> +
+  ! <rho v^2 v_z/2>, in F_sun
   subroutine resolved_L(S, Lres)
     real(dp), intent(in) :: S(0:n_r, 19)
     real(dp), intent(out) :: Lres(1:n_r)
@@ -1089,56 +927,39 @@ contains
     real(dp) :: w
     do i = 1, n_r
       w = S(i, 1)
-      Lres(i) = 4.0_dp*pi*r_c(i)**2*(S(i, 12)/w - (S(i, 13)/w)*(S(i, 14)/w) + S(i, 15)/w)/Lsun
+      Lres(i) = (S(i, 12)/w - (S(i, 13)/w)*(S(i, 14)/w) + S(i, 15)/w)/f_sun()
     end do
   end subroutine resolved_L
 
-  ! Every cell of the radial indices dump_shells, one file per rank
-  ! (out_dir/shell_dump_rNNNN.dat): i, patch, the position as a global unit
-  ! vector (x, y, z; Yin = global frame, Yang mapped by (x,y,z) -> (-x,z,y)),
-  ! the overlap weight (solid angle, 1/2 where both patches' cores cover the
-  ! point, 0 in a margin), v_r, the horizontal velocity as a global Cartesian
-  ! vector, rho1/rho0, s1
+  ! Every cell of the vertical indices dump_shells, one file per rank
+  ! (out_dir/shell_dump_rNNNN.dat): i, the position x, y [Mm], the weight
+  ! (the cell's horizontal area [cm^2]), v_z, v_x, v_y, rho1/rho0, s1
+  ! (use_B: B_x, B_y, B_z)
   module subroutine dump_shells_write()
-    real(dp) :: th, ph, th2, ph2, e(3,3), x(3), vh(3), w, bvec(3)
+    real(dp) :: w
     integer :: u, jb, ib, j, k, n, i
     character(len=300) :: name
     if (all(dump_shells <= 0)) return
     write(name, '(A,A,I4.4,A)') trim(out_dir), '/shell_dump_r', my_rank, '.dat'
     open(newunit=u, file=trim(name), status='replace', action='write')
-    write(u, '(A)') '# i  patch  x  y  z  weight  v_r  vh_x  vh_y  vh_z [cm/s]  rho1/rho0  s1  (use_B: B_x  B_y  B_z [G])'
+    write(u, '(A)') '# i  x[Mm]  y[Mm]  weight[cm2]  v_z  v_x  v_y [cm/s]  rho1/rho0  s1  (use_B: B_x  B_y  B_z [G])'
     do jb = 1, nBlock
       ib = iBlockList_I(jb)
       call cz_bind(ib)
       do k = 1, nb(3)
         do j = 1, nb(2)
-          th = Metric_DB(2, ib)%X_I(j)
-          ph = Metric_DB(3, ib)%X_I(k)
-          e = sph_basis(th, ph)
           w = Metric_DB(2, ib)%Vol_I(j)*Metric_DB(3, ib)%Vol_I(k)
-          if (.not. core(th, ph)) then
-            w = 0.0_dp
-          else
-            call yy_angles(th, ph, th2, ph2)
-            if (core(th2, ph2)) w = 0.5_dp*w
-          end if
           do n = 1, size(dump_shells)
             i = dump_shells(n) - r_off
             if (i < 1 .or. i > nb(1)) cycle
-            x = e(:, 1)
-            vh = State_GVB(i, j, k, vt_, ib)*e(:, 2) + State_GVB(i, j, k, vp_, ib)*e(:, 3)
-            if (Key_IB(KP, ib) == 2) then
-              x = yy_cart(x)
-              vh = yy_cart(vh)
-            end if
             if (use_B) then
-              bvec = State_GVB(i, j, k, br_, ib)*e(:, 1) + State_GVB(i, j, k, bt_, ib)*e(:, 2) &
-                  + State_GVB(i, j, k, bp_, ib)*e(:, 3)
-              if (Key_IB(KP, ib) == 2) bvec = yy_cart(bvec)
-              write(u, '(2I5,3F12.8,ES14.6,4ES14.6,2ES14.6,3ES14.6)') r_off + i, Key_IB(KP, ib), x, w, &
-                  State_GVB(i, j, k, vr_, ib), vh, State_GVB(i, j, k, rho1_, ib)/rho0(i), State_GVB(i, j, k, s1_, ib), bvec
+              write(u, '(I5,2F12.4,ES14.6,3ES14.6,2ES14.6,3ES14.6)') r_off + i, Metric_DB(2, ib)%X_I(j)/1.0e8_dp, &
+                  Metric_DB(3, ib)%X_I(k)/1.0e8_dp, w, State_GVB(i, j, k, vr_:vp_, ib), &
+                  State_GVB(i, j, k, rho1_, ib)/rho0(i), State_GVB(i, j, k, s1_, ib), &
+                  State_GVB(i, j, k, bt_, ib), State_GVB(i, j, k, bp_, ib), State_GVB(i, j, k, br_, ib)
             else
-              write(u, '(2I5,3F12.8,ES14.6,4ES14.6,2ES14.6)') r_off + i, Key_IB(KP, ib), x, w, State_GVB(i, j, k, vr_, ib), vh, &
+              write(u, '(I5,2F12.4,ES14.6,3ES14.6,2ES14.6)') r_off + i, Metric_DB(2, ib)%X_I(j)/1.0e8_dp, &
+                  Metric_DB(3, ib)%X_I(k)/1.0e8_dp, w, State_GVB(i, j, k, vr_:vp_, ib), &
                   State_GVB(i, j, k, rho1_, ib)/rho0(i), State_GVB(i, j, k, s1_, ib)
             end if
           end do
@@ -1147,11 +968,6 @@ contains
     end do
     call cz_unbind()
     close(u)
-  contains
-    logical function core(t, p)
-      real(dp), intent(in) :: t, p
-      core = t >= 0.25_dp*pi .and. t <= 0.75_dp*pi .and. abs(p) <= 0.75_dp*pi
-    end function core
   end subroutine dump_shells_write
 
   ! Order-independent checksum of the interior state of all blocks, to
@@ -1186,7 +1002,7 @@ contains
   module subroutine max_mach_report(iStep, t)
     integer, intent(in) :: iStep
     real(dp), intent(in) :: t
-    real(dp) :: out(n_field), rhop, cs, m, mbest, gbest, e(3,3), x(3), loc(8)
+    real(dp) :: out(n_field), rhop, cs, m, mbest, gbest, loc(8)
     integer :: jb, ib, i, j, k
     character(len=400) :: msg
     mbest = -1.0_dp
@@ -1202,21 +1018,18 @@ contains
             m = norm2(State_GVB(i, j, k, vr_:vp_, ib))/cs
             if (m > mbest) then
               mbest = m
-              e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
-              x = e(:, 1)
-              if (Key_IB(KP, ib) == 2) x = yy_cart(x)
-              loc = [r_c(i), asin(max(-1.0_dp, min(1.0_dp, x(3))))*180.0_dp/pi, atan2(x(2), x(1))*180.0_dp/pi, &
+              loc = [r_c(i), Metric_DB(2, ib)%X_I(j)/1.0e8_dp, Metric_DB(3, ib)%X_I(k)/1.0e8_dp, &
                   exp(out(F_LNT)), rhop, State_GVB(i, j, k, vr_, ib), hypot(State_GVB(i, j, k, vt_, ib), &
                   State_GVB(i, j, k, vp_, ib)), cs]
               if (use_B) then
                 write(msg, '(A,F9.4,A,F7.2,A,F8.2,A,F10.1,A,ES10.3,A,ES10.3,A,2F9.2,A,F8.2,A,F9.2,A)') 'max Mach: r/R ', &
-                    loc(1)/6.957e10_dp, '  lat ', loc(2), '  lon ', loc(3), '  z[km] ', z_c(i)/1.0e5_dp, '  T ', loc(4), &
-                    '  rho ', loc(5), '  v_r, v_h [km/s] ', loc(6)/1.0e5_dp, loc(7)/1.0e5_dp, '  c_s ', loc(8)/1.0e5_dp, &
+                    loc(1)/6.957e10_dp, '  x[Mm] ', loc(2), '  y[Mm] ', loc(3), '  z[km] ', z_c(i)/1.0e5_dp, '  T ', loc(4), &
+                    '  rho ', loc(5), '  v_z, v_h [km/s] ', loc(6)/1.0e5_dp, loc(7)/1.0e5_dp, '  c_s ', loc(8)/1.0e5_dp, &
                     '  |B| [G] ', norm2(State_GVB(i, j, k, br_:bp_, ib)), ''
               else
                 write(msg, '(A,F9.4,A,F7.2,A,F8.2,A,F10.1,A,ES10.3,A,ES10.3,A,2F9.2,A,F8.2)') 'max Mach: r/R ', &
-                    loc(1)/6.957e10_dp, '  lat ', loc(2), '  lon ', loc(3), '  z[km] ', z_c(i)/1.0e5_dp, '  T ', loc(4), &
-                    '  rho ', loc(5), '  v_r, v_h [km/s] ', loc(6)/1.0e5_dp, loc(7)/1.0e5_dp, '  c_s ', loc(8)/1.0e5_dp
+                    loc(1)/6.957e10_dp, '  x[Mm] ', loc(2), '  y[Mm] ', loc(3), '  z[km] ', z_c(i)/1.0e5_dp, '  T ', loc(4), &
+                    '  rho ', loc(5), '  v_z, v_h [km/s] ', loc(6)/1.0e5_dp, loc(7)/1.0e5_dp, '  c_s ', loc(8)/1.0e5_dp
               end if
             end if
           end do
@@ -1233,11 +1046,8 @@ contains
 
   ! Tecplot file of the state in out_dir: rho1, v_x, v_y, v_z, s1, [B_x, B_y,
   ! B_z,] T - T0, rho, T and the Mach number |v|/c_s (cell centres; ARBOR
-  ! writes node values). The vectors as Cartesian components in the global
-  ! (Yin) frame, the frame of the X, Y, Z coordinates (Yang's rotated into it).
-  ! The plot quantities sit in slots beyond 8 and only those are passed to the
-  ! writer: its ghost fill then treats them as scalars (it rotates the slots
-  ! declared as spherical vectors, v at vr_ and B at br_, which hold nothing here)
+  ! writes node values). ARBOR's X, Y, Z are the box's z, x, y; the vector
+  ! components as (x, y, z). The plot quantities sit in slots beyond 8.
   module subroutine cz_write_plot(self, dom, iStep, t)
     class(cz3d_app_t), intent(inout) :: self
     type(arbor_domain_t), intent(in) :: dom
@@ -1246,7 +1056,7 @@ contains
     integer, parameter :: o = 8
     character(len=300) :: name
     real(dp), allocatable :: P_GVB(:,:,:,:,:)
-    real(dp) :: out(n_field), rhop, e(3,3), vc(3), bc(3)
+    real(dp) :: out(n_field), rhop
     integer :: jb, ib, i, j, k, n, q
     n = merge(12, 9, use_B)
     allocate(P_GVB(1-ng:nb(1)+ng, 1-ng:nb(2)+ng, 1-ng:nb(3)+ng, o + n, nBlockMax))
@@ -1257,18 +1067,12 @@ contains
       call cz_bind(ib)
       do k = 1, nb(3)
         do j = 1, nb(2)
-          e = sph_basis(Metric_DB(2, ib)%X_I(j), Metric_DB(3, ib)%X_I(k))
           do i = 1, nb(1)
-            vc = matmul(e, State_GVB(i, j, k, vr_:vp_, ib))  ! Cartesian in the patch frame
-            if (Key_IB(KP, ib) == 2) vc = yy_cart(vc)       ! Yang -> the global frame
             P_GVB(i, j, k, o+1, ib) = State_GVB(i, j, k, rho1_, ib)
-            P_GVB(i, j, k, o+2:o+4, ib) = vc
+            P_GVB(i, j, k, o+2:o+4, ib) = [State_GVB(i, j, k, vt_, ib), State_GVB(i, j, k, vp_, ib), State_GVB(i, j, k, vr_, ib)]
             P_GVB(i, j, k, o+5, ib) = State_GVB(i, j, k, s1_, ib)
-            if (use_B) then
-              bc = matmul(e, State_GVB(i, j, k, br_:bp_, ib))
-              if (Key_IB(KP, ib) == 2) bc = yy_cart(bc)
-              P_GVB(i, j, k, o+6:o+8, ib) = bc
-            end if
+            if (use_B) P_GVB(i, j, k, o+6:o+8, ib) = [State_GVB(i, j, k, bt_, ib), State_GVB(i, j, k, bp_, ib), &
+                State_GVB(i, j, k, br_, ib)]
             rhop = rho0(i) + rq(i)*State_GVB(i, j, k, rho1_, ib)
             call eos_eval(tab, rhop, s0(i) + State_GVB(i, j, k, s1_, ib), out)
             P_GVB(i, j, k, o+q+6, ib) = exp(out(F_LNT)) - T0(i)
@@ -1283,10 +1087,10 @@ contains
     write(name, '(A,A,I8.8,A)') trim(out_dir), '/plot_', iStep, '.plt'
     if (use_B) then
       call arbor_plot_tecplot(dom, name, P_GVB, iVarMin=o+1, iVarMax=o+n, names=['rho1', 'vx  ', 'vy  ', 'vz  ', &
-          's1  ', 'Bx  ', 'By  ', 'Bz  ', 'T1  ', 'rho ', 'T   ', 'Mach'], t=t, title='cztr3d')
+          's1  ', 'Bx  ', 'By  ', 'Bz  ', 'T1  ', 'rho ', 'T   ', 'Mach'], t=t, title='cztr_box')
     else
       call arbor_plot_tecplot(dom, name, P_GVB, iVarMin=o+1, iVarMax=o+n, names=['rho1', 'vx  ', 'vy  ', 'vz  ', &
-          's1  ', 'T1  ', 'rho ', 'T   ', 'Mach'], t=t, title='cztr3d')
+          's1  ', 'T1  ', 'rho ', 'T   ', 'Mach'], t=t, title='cztr_box')
     end if
   end subroutine cz_write_plot
 

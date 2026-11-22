@@ -1,0 +1,32 @@
+! CZTR_box smoke test with the atmosphere: the 560 grid trimmed at cell 336
+! (73.7 Mm, the radial block top nearest 100 Mm), the 'box' top, MHD with
+! the potential-field test seed (b_seed_test: analytic check), si_radial,
+! the heating terms of step 2; a few steps from the init profile.
+!   mpirun -np 8 ./cztr_box.x runs_box/smoke_atm.nml
+&cz3d
+  grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 336
+  table_file = 'data/eos_table_wind.bin'
+  out_dir = 'output/smoke_atm'
+  wall_top = 'box'
+  top_energy = 'eddington', grey_tau_above = 0.01, grey_top_km = 1000.0, grey_atm_blocks = 1
+  use_convection = .true., mlt_switch = .true., mlt_R0 = 1.0, mlt_p = 4.0
+  rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
+  diffusion_heating = .true.
+  diff_top_km = 500.0, diff_top_above_km = 50.0
+  ds1_random = 10.0
+  box_lx_mm = 696.0, box_ly_mm = 696.0, n_x = 32, n_y = 32, nb_x = 16, nb_y = 16, nb_r = 28
+  use_atmosphere = .true., atm_match_base = .true.
+  rho_floor = 1.0e-24
+  H_ext = 5.0e-7, lambda_ext_rsun = 0.7, H_c = 3.0e-5, lambda_c_km = 4.0e4
+  H_B = 4.0e-5, lambda_B_km = 4.0e4, n_gate = 2.0e11, H_B_sat_G = 50.0
+  cond_r_rsun = 5.0, alpha_cl = 1.05
+  use_B = .true., b_seed = 'potential', b_seed_test = .true., b_seed_G = 10.0
+  b_bc_bottom = 'conductor', b_bc_top = 'potential'
+  cond_along_b = .true., cond_dB0_G = 10.0, si_alfven = .true., wave_cfl_cs_only = .true.
+  va_dt_target = 1.0, va_floor_cs = 1.5, b_diff_form = 'resistive', b_eta_dr = 1.0
+  dt1 = 0.0, mr_levels = 0
+  si_radial = .true., wave_cfl_max = 1.0, trac_Tc = 5.0e5, trac_Tlow = 1.2e4
+  t_end = 1.0e9, n_step_max = 40, dt_max = 20.0
+  n_log = 10, dt_prof = 0.0, prof_every = 40, plot_dt = 0.0, restart_dt = 0.0
+  dump_shells = 196, 197, 210, 250, 300, 336
+/
