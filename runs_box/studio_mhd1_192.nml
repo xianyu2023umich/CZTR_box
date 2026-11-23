@@ -1,0 +1,30 @@
+! Studio run B: cascade level 1 MHD from run A's day-50 state (set
+! restart_from to its last restart file, restart_YYYYYYYY.rst at day 50).
+! The field from 0 plus the zero-net-flux seed B_x = 100 G sin(2 pi y/Ly)
+! below -55 Mm, none above -35 Mm (b_seed_ny = 1: the field's growth or
+! decay is the dynamo's), the potential top, the f-plane at 30 deg (414 nHz),
+! va_max 10 km/s. Up to a model year (t_end day 415; stop and continue from
+! the restarts at will: restart_from + restart_new_output = .false.).
+! Profiles daily, restarts every 20 days (~0.5 GB each), layer dumps of
+! B at 4 heights at the end, an export at the end.
+! Watch log.txt: E_mag/E_kin (column 22), max |B| (21); tools/mag_evolution.py.
+!   mpirun -np N ./cztr_box.x runs_box/studio_mhd1_192.nml
+&cz3d
+  grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 112
+  table_file = 'data/eos_table_wind.bin'
+  box_lx_mm = 696.0, box_ly_mm = 696.0, n_x = 192, n_y = 192, nb_x = 24, nb_y = 24, nb_r = 28
+  diffusion_heating = .true.
+  out_dir = 'output/studio_mhd1_192'
+  restart_from = 'output/studio_hd1_192/restart_YYYYYYYY.rst', restart_new_output = .true.
+  wall_top = 'face'
+  use_convection = .false.
+  top_energy = 'cooling', cool_width_hp = 1.0, grey_top_km = 1000.0
+  rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
+  use_B = .true., b_bc_bottom = 'conductor', b_bc_top = 'potential', glm_ch = 'cfl', va_max = 1.0e6
+  b_seed = 'horizontal', b_seed_G = 100.0, b_seed_z1_km = -55000.0, b_seed_z2_km = -35000.0, b_seed_ny = 1
+  omega_rot = 2.6e-6, fplane_lat_deg = 30.0
+  t_end = 35856000.0, n_step_max = 10000000, dt_max = 1.0e4
+  n_log = 100, prof_every = 1800, restart_dt = 1728000.0
+  export_state = .true.
+  dump_shells = 20, 60, 100, 110
+/

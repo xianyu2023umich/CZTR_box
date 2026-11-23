@@ -1,0 +1,22 @@
+! Cascade insertion test, step 2: level 2 (top 0.991 R) from step 1's
+! export at day 50 (cells 113..140 from the init file), hydro at 64^2, 10 days (to
+! t = 60 d), a profile every 450 steps (~2 h): the transient at the old top.
+!   mpirun -np 8 ./cztr_box.x runs_box/test_casc_hd2.nml
+&cz3d
+  grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 140
+  table_file = 'data/eos_table_wind.bin'
+  box_lx_mm = 696.0, box_ly_mm = 696.0, n_x = 64, n_y = 64, nb_x = 16, nb_y = 16, nb_r = 28
+  diffusion_heating = .true.
+  out_dir = 'output/test_casc_hd2'
+  import_dir = 'output/test_casc_hd1'
+  wall_top = 'face'
+  use_convection = .false.
+  top_energy = 'cooling', cool_width_hp = 1.0, grey_top_km = 1000.0
+  rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
+  use_B = .false., b_bc_bottom = 'conductor', b_bc_top = 'potential', glm_ch = 'cfl', va_max = 1.0e6
+  b_seed = 'none'
+  omega_rot = 2.6e-6, fplane_lat_deg = 30.0
+  t_end = 5184000.0, n_step_max = 100000, dt_max = 1.0e4
+  n_log = 100, prof_every = 450, restart_dt = 172800.0
+  export_state = .true.
+/

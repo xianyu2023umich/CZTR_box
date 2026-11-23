@@ -1,0 +1,25 @@
+! Cascade test, level 1 MHD: from the hydro level 1 at day 50
+! (test_casc_hd1, convecting), the field added (the restart file has no B:
+! B, psi from 0 plus the 'horizontal' seed B_x = 100 G below -55 Mm, none
+! above -35 Mm; the top at -32.9 Mm), the potential top, the f-plane at 30
+! deg, va_max 10 km/s; 64^2; 20 days (to day 70): how the field grows.
+!   mpirun -np 8 ./cztr_box.x runs_box/test_casc_mhd1.nml
+&cz3d
+  grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 112
+  table_file = 'data/eos_table_wind.bin'
+  box_lx_mm = 696.0, box_ly_mm = 696.0, n_x = 64, n_y = 64, nb_x = 16, nb_y = 16, nb_r = 28
+  diffusion_heating = .true.
+  out_dir = 'output/test_casc_mhd1'
+  restart_from = 'output/test_casc_hd1/restart_00074369.rst', restart_new_output = .true.
+  wall_top = 'face'
+  use_convection = .false.
+  top_energy = 'cooling', cool_width_hp = 1.0, grey_top_km = 1000.0
+  rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
+  use_B = .true., b_bc_bottom = 'conductor', b_bc_top = 'potential', glm_ch = 'cfl', va_max = 1.0e6
+  b_seed = 'horizontal', b_seed_G = 100.0, b_seed_z1_km = -55000.0, b_seed_z2_km = -35000.0
+  omega_rot = 2.6e-6, fplane_lat_deg = 30.0
+  t_end = 6048000.0, n_step_max = 100000, dt_max = 1.0e4
+  n_log = 100, prof_every = 900, restart_dt = 432000.0
+  export_state = .true.
+  dump_shells = 20, 60, 100, 110
+/

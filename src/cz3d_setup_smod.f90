@@ -195,7 +195,14 @@ contains
         else
           w = cos(0.5_dp*pi*(z_c(i) - z1)/(z2 - z1))**2
         end if
-        State_GVB(i, 1:nb(2), 1:nb(3), bt_, iBlock) = State_GVB(i, 1:nb(2), 1:nb(3), bt_, iBlock) + b_seed_G*w
+        if (b_seed_ny > 0) then                        ! (no net flux)
+          do k = 1, nb(3)
+            State_GVB(i, 1:nb(2), k, bt_, iBlock) = State_GVB(i, 1:nb(2), k, bt_, iBlock) + b_seed_G*w &
+                *sin(2.0_dp*pi*real(b_seed_ny, dp)*Metric_DB(3, iBlock)%X_I(k)/(box_ly_mm*1.0e8_dp))
+          end do
+        else
+          State_GVB(i, 1:nb(2), 1:nb(3), bt_, iBlock) = State_GVB(i, 1:nb(2), 1:nb(3), bt_, iBlock) + b_seed_G*w
+        end if
       end do
     end select
   end subroutine seed_field

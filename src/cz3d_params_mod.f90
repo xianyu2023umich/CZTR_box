@@ -325,7 +325,10 @@ module cz3d_params_mod
   ! 'horizontal': B_x = b_seed_G w(z) (divergence free: B_x depends on z
   ! only), w = 1 below b_seed_z1_km, 0 above b_seed_z2_km, a sin^2 step
   ! between (keeps it off the top; the box's analogue of CZTR_3D's toroidal
-  ! seed);
+  ! seed); b_seed_ny > 0: B_x = b_seed_G w(z) sin(2 pi b_seed_ny y/Ly)
+  ! instead, no net flux (still divergence free: B_x depends on y and z only),
+  ! so the field's growth or decay is the dynamo's (a uniform B_x is a mean
+  ! field the periodic box keeps);
   ! 'potential' (use_atmosphere): the field above the join replaced by the
   ! potential field of the join cell's B_z in the periodic box (FFT: each
   ! horizontal mode decays as exp(-k (z - z_join)); the mean B_z continues
@@ -338,6 +341,7 @@ module cz3d_params_mod
   character(len=12) :: b_seed = 'none'
   real(dp) :: b_seed_G = 100.0_dp, b_seed_z1_km = -20000.0_dp, b_seed_z2_km = -5000.0_dp
   logical :: b_seed_test = .false.
+  integer :: b_seed_ny = 0
   ! friction on the velocity above the join (a relaxation of the field and
   ! the atmosphere towards force balance without violent flows): v_h, and
   ! v_r's deviation from the init file's profile (the wind), multiplied
@@ -584,7 +588,7 @@ module cz3d_params_mod
       b_bc_top, b_seed, b_seed_G, export_state, import_dir, plot_blocks, box_lx_mm, box_ly_mm, n_x, n_y, &
       nb_x, nb_y, patch_x_mm, patch_y_mm, patch_radius_mm, probe_x_mm, probe_y_mm, probe_radius_mm, &
       region_x_mm, region_y_mm, region_radius_mm, region_z_km, region_every, b_seed_z1_km, b_seed_z2_km, &
-      box_top_vz, b_seed_test, omega_rot, fplane_lat_deg, coriolis
+      box_top_vz, b_seed_test, b_seed_ny, omega_rot, fplane_lat_deg, coriolis
 
 contains
 
