@@ -879,6 +879,7 @@ contains
     real(dp), intent(in) :: t
     real(dp) :: S(0:n_r, 19)
     character(len=300) :: name
+    integer :: ut, it
     call horizontal_sums(S, .true.)
     write(name, '(A,A,I4.4,A)') trim(out_dir), '/profile_', i_prof, '.dat'
     call write_profile(S, name, 'horizontal means (area weighted) and rms deviations; L columns: F/F_sun')
@@ -887,6 +888,18 @@ contains
       call horizontal_sums(S, .true., patch_level)
       write(name, '(A,A,I4.4,A)') trim(out_dir), '/profile_patch_', i_prof, '.dat'
       call write_profile(S, name, 'means over the refined patch (blocks of level patch_level) and rms deviations')
+    end if
+    if (turb_on .and. allocated(turb_v) .and. is_root) then
+      ! the turbulent closure's profile (turb_c_*)
+      write(name, '(A,A,I4.4,A)') trim(out_dir), '/turb_', i_prof, '.dat'
+      open(newunit=ut, file=trim(name), status='replace', action='write')
+      write(ut, '(A,ES14.6,A,I0,A)') '# t = ', t, ' s; step ', iStep, '; the turbulent closure (turb_c_*)'
+      write(ut, '(A)') '# i  z[km]  <f v_MLT>[cm/s]  ell[cm]  eta_t[cm2/s]  nu_t[cm2/s]  gamma_z[cm/s]'
+      do it = 1, n_r
+        write(ut, '(I5,F14.3,5ES14.5)') it, z_c(it)/1.0e5_dp, turb_v(it), alpha_mlt*p0(it)/(rho0(it)*g_c(it)), &
+            turb_eta(it), turb_nu(it), turb_gam(it)
+      end do
+      close(ut)
     end if
     i_prof = i_prof + 1
     t_next_prof = t_prof0 + i_prof*dt_prof

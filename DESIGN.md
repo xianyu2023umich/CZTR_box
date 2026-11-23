@@ -293,3 +293,43 @@ Potential top at deep walls and f-plane rotation (2026-11-22):
 Next: a hydro CZ run to a convective steady state
 (the deep CZ's thermal adjustment to the box flux), then the atmosphere and
 field; a vertical-view synthetic image.
+
+Unresolved near-surface turbulence and the field (2026-11-23):
+- Why: the 0.47 deg CZTR_3D step-2 crashes all sit at grid-scale kG surface
+  field (mostly horizontal, ~1% of the area) that the Alfven cap lets pile up
+  at the join. MLT carries the heat of the unresolved granulation but does
+  nothing to B: no turbulent diffusion or pumping keeps the surface field weak
+  and near radial, as surface flux transport needs (250-600 km^2/s; downward
+  pumping in flux-transport dynamos, Karak & Cameron 2016).
+- Turbulent closure, local per cell from the cell's MLT state (the same
+  column evaluation as the heat flux; f_mlt v_MLT, v_MLT of the full MLT flux
+  F/f, ell = alpha_mlt H_p): turb_c_eta (eta_t = c f v ell/3 added to the
+  resistive eta: radial implicit, horizontal explicit, Ohmic heat),
+  turb_c_nu (nu_t on v: horizontal explicit, radial implicit with the
+  semi-implicit column solver, the kinetic energy lost into s1),
+  turb_c_gamma (downward pumping gamma_z = -c f v in the induction only,
+  E = (v + gamma_z e_z) x B, 0 beyond the walls). All default 0; need
+  use_convection, si_radial, global steps (eta: b_diff_form = 'resistive').
+  out_dir/turb_NNNN.dat: the horizontal means. Local, not a profile, so that
+  heat flux, eta, nu, gamma come from one state (an LES-style subgrid
+  closure) and the magnetic suppression acts where the field is.
+- mlt_gough_tayler: MLT sees grad - grad_ad - delta, delta = B_z^2/(B_z^2 +
+  4 pi Gamma_1 P) at each face (Gough & Tayler 1966; magnetic stellar models).
+  Vertical field suppresses convection: umbral darkening; the closure
+  follows through v_MLT. Kept (the user).
+- turb_quench (option, default off): the coefficients times q = 1/(1 +
+  B_h^2/B_eq^2), B_eq^2 = 4 pi rho v_MLT^2. A heuristic for the horizontal
+  field (mean-field quenching is usually isotropic in |B|; Gough & Tayler
+  covers B_z, so B_h only to avoid double counting). Near the surface B_eq
+  ~ 90 G: strong horizontal flux is not the turbulence's to remove but
+  rises by its own buoyancy, which needs the real Lorentz force (the cap).
+- Tests (laptop, 8 ranks): defaults bit-identical (no-FMA smoke_hd 16225155724550,
+  smoke_atm 24447136486753); level 4 at 32^2: <f v_MLT> 90 m/s at -28 Mm to
+  1.8 km/s at -400 km, 0 in the top ~300 km (no MLT flux there), eta_t ~
+  1.3-3.7e12 cm^2/s with c = 1; signs on a static seed: pumping moves B_h
+  down, eta_t spreads it; nu_t stable on a convecting level-1 restart (+13%
+  cost at 64^2); Gough & Tayler with a uniform 300 G B_z: MLT flux 1.00 ->
+  0.80 at -2 Mm, 0.29 -> 0.04 at -0.4 Mm, top luminosity 0.99 -> 0.92 within
+  6 min (heat collecting below). Open: c_gamma (1 gives 1-2 km/s near the
+  top; flux transport suggests ~0.02-0.1); a convecting level-4 run with
+  field, closure on/off.
