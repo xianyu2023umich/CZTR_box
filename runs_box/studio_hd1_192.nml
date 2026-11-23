@@ -2,25 +2,31 @@
 ! 696 Mm (3.6 Mm cells), from rest (random s1) to day 100: the onset (~25-35
 ! days at 64^2) and the relaxation (64^2: not yet relaxed at day 50). Blocks
 ! 28 x 24 x 24: 256 blocks (64 columns x 4), any rank count dividing 256.
-! dt ~49-58 s (the base cell's vertical CFL; the horizontal cells do not set
-! it). Profiles every ~12 h, restarts every 10 days, an export at the end.
-! Watch output/studio_hd1_192/log.txt (max |v|, the flux range) and the
+! 2026-11-23: rsst_q = -0.5 (was 0): c_red = c_s(500 km) (c_s/c_s(500 km))^-0.5,
+! 1.8 km/s at the bottom, 3.1 km/s at this top (was 9 km/s at every depth
+! below 500 km); the reduced Mach number of the saturated convection
+! (estimated from the 0.47 deg profile) ~0.06-0.09 below -10 Mm instead of
+! 0.01-0.04. dt ~190-210 s (the top cell's vertical CFL; was ~49-58 s, the
+! base cell's), measured 58 -> 208 s at 64^2. The q = 0 run's output stays in
+! output/studio_hd1_192 (out_dir now studio_hd1_q05). Profiles every ~12 h,
+! restarts every 10 days, an export at the end.
+! Watch output/studio_hd1_q05/log.txt (max |v|, the flux range) and the
 ! profiles (tools/level_evolution.py).
-! Studio (M2 Max, 8 ranks): ~14 h.
+! Studio (M2 Max, 8 ranks): ~4 h (q = 0: ~14 h).
 !   mpirun -np N ./cztr_box.x runs_box/studio_hd1_192.nml
 &cz3d
   grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 112
   table_file = 'data/eos_table_wind.bin'
   box_lx_mm = 696.0, box_ly_mm = 696.0, n_x = 192, n_y = 192, nb_x = 24, nb_y = 24, nb_r = 28
   diffusion_heating = .true.
-  out_dir = 'output/studio_hd1_192'
+  out_dir = 'output/studio_hd1_q05'
   ds1_random = 1.0
   wall_top = 'face'
   use_convection = .false.
   top_energy = 'cooling', cool_width_hp = 1.0, grey_top_km = 1000.0
-  rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
+  rsst_depth_km = 500.0, rsst_q = -0.5, rsst_form = 'hotta2012'
   omega_rot = 2.6e-6, fplane_lat_deg = 30.0
   t_end = 8640000.0, n_step_max = 1000000, dt_max = 1.0e4
-  n_log = 100, prof_every = 900, restart_dt = 864000.0
+  n_log = 100, prof_every = 216, restart_dt = 864000.0
   export_state = .true.
 /
