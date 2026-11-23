@@ -1,11 +1,12 @@
 ! Studio run A: cascade level 1 (top 0.954 R), hydro, 192^2 columns over
-! 696 Mm (3.6 Mm cells), from rest (random s1) to day 50: the onset (~25-35
-! days at 64^2) and the first relaxation, as test_casc_hd1 at 64^2. Blocks
+! 696 Mm (3.6 Mm cells), from rest (random s1) to day 100: the onset (~25-35
+! days at 64^2) and the relaxation (64^2: not yet relaxed at day 50). Blocks
 ! 28 x 24 x 24: 256 blocks (64 columns x 4), any rank count dividing 256.
 ! dt ~49-58 s (the base cell's vertical CFL; the horizontal cells do not set
 ! it). Profiles every ~12 h, restarts every 10 days, an export at the end.
 ! Watch output/studio_hd1_192/log.txt (max |v|, the flux range) and the
 ! profiles (tools/level_evolution.py).
+! Studio (M2 Max, 8 ranks): ~14 h.
 !   mpirun -np N ./cztr_box.x runs_box/studio_hd1_192.nml
 &cz3d
   grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 112
@@ -19,7 +20,7 @@
   top_energy = 'cooling', cool_width_hp = 1.0, grey_top_km = 1000.0
   rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
   omega_rot = 2.6e-6, fplane_lat_deg = 30.0
-  t_end = 4320000.0, n_step_max = 1000000, dt_max = 1.0e4
+  t_end = 8640000.0, n_step_max = 1000000, dt_max = 1.0e4
   n_log = 100, prof_every = 900, restart_dt = 864000.0
   export_state = .true.
 /
