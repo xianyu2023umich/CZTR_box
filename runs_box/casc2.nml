@@ -1,0 +1,29 @@
+! Radial cascade, level 2 (CZ_3D/notes/radial_cascade.md): the CZ alone to
+! cell 140, top at 0.991 R (6.2 Mm deep), dt ~72 s (128^2, 5.4 Mm, laptop
+! 2026-11-22). Face wall with a cooling layer one H_p wide removing F_sun
+! (deep_c2's top), MLT off, RSST anchored 500 km deep (as level 4: one RSST through the cascade), export at the end for the
+! next level (whose blocks above cell 140 start from the init file).
+! Lengths per the plan: level 1 years, then days to weeks per level.
+!   mpirun -np 8 ./cztr_box.x runs_box/casc2.nml
+! MHD: the field from the level below (import); mhd5's va_max 10 km/s.
+! The top field condition: the potential field (the next level's new layer
+! starts with its extension: B continuous); f-plane rotation at 30 deg,
+! the solar rate (414 nHz).
+&cz3d
+  grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 140
+  table_file = 'data/eos_table_wind.bin'
+  box_lx_mm = 696.0, box_ly_mm = 696.0, n_x = 128, n_y = 128, nb_x = 16, nb_y = 16, nb_r = 28
+  diffusion_heating = .true.
+  out_dir = 'output/casc2'
+  import_dir = 'output/casc1'
+  wall_top = 'face'
+  use_convection = .false.
+  top_energy = 'cooling', cool_width_hp = 1.0, grey_top_km = 1000.0
+  rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
+  use_B = .true., b_bc_bottom = 'conductor', b_bc_top = 'potential', glm_ch = 'cfl', va_max = 1.0e6
+  b_seed = 'none'
+  omega_rot = 2.6e-6, fplane_lat_deg = 30.0
+  t_end = 1.0e9, n_step_max = 1000, dt_max = 1.0e4
+  n_log = 100, prof_every = 500, restart_dt = 86400.0
+  export_state = .true.
+/

@@ -80,6 +80,7 @@ module cz3d_app_mod
   integer, allocatable :: imp_key(:,:), imp_file(:)
   integer(i8), allocatable :: imp_pos(:)
   integer :: imp_nb(3) = 0, imp_nv = 0
+  integer, public :: imp_top = 0          ! (imp_top: the export's top cell)
   ! rq(i): the physical density perturbation is rq rho1 (rsst_form =
   ! 'hotta2015': 1/xi^2, rho1 being the scaled xi^2 rho1; else 1). The
   ! inertia, mass and momentum fluxes use rho0 + rho1, the EOS and buoyancy
@@ -228,7 +229,7 @@ module cz3d_app_mod
   integer, parameter :: nAcc = 18
   real(dp), allocatable :: bgf_r(:)
 
-  public :: timers_report, cz_smooth_b, cz_columns_to_ranks, cz_import_cz, cz_match_base, cz_seed_potential, max_mach_report, cz_n_var, cz_field_from_hydro, export_state_write, import_open, import_max_level, import_criterion, import_meta, cz_setup, cz_transport_all, cz_log, cz_profile, wall_bc, state_checksum, budget_start, dump_shells_write
+  public :: timers_report, cz_smooth_b, cz_columns_to_ranks, cz_import_cz, cz_match_base, cz_seed_potential, cz_extend_potential, max_mach_report, cz_n_var, cz_field_from_hydro, export_state_write, import_open, import_max_level, import_criterion, import_meta, cz_setup, cz_transport_all, cz_log, cz_profile, wall_bc, state_checksum, budget_start, dump_shells_write
 
   ! The routines in the submodules (src/cz3d_setup_smod.f90, cz3d_diag_smod.f90,
   ! cz3d_synth_smod.f90) called from outside their submodule: their interfaces
@@ -258,6 +259,9 @@ module cz3d_app_mod
     end subroutine cz_seed_potential
     module subroutine cz_top_potential()
     end subroutine cz_top_potential
+    module subroutine cz_extend_potential(ig0)
+      integer, intent(in) :: ig0
+    end subroutine cz_extend_potential
     module subroutine export_state_write(t, iStep)
       real(dp), intent(in) :: t
       integer, intent(in) :: iStep
@@ -484,6 +488,9 @@ contains
       else
         call arbor_bc_mirror(A, v, v, iBlock, iDir, iSide, nGhost, +1, wall)
       end if
+      ! b_bc_top = 'potential': the top ghosts' B the potential field
+      if (iDir == 1 .and. iSide == 2 .and. v >= br_ .and. v <= bp_ .and. b_bc_top == 'potential' .and. btop_ready) &
+          call potential_ghosts(v)
       ! the density: its relative perturbation rq rho1/rho0 mirrored (the
       ! background changes steeply across the wall; mirroring rho1 itself
       ! gives negative ghost densities above an evacuated top cell)
@@ -502,13 +509,7 @@ contains
       m = nb(1)
       do v = iVarMin, min(iVarMax, nv)
         if (v >= br_ .and. v <= bp_ .and. b_bc_top == 'potential' .and. btop_ready) then
-          do g = 1, nGhost
-            A(m+g, 1:nb(2), 1:nb(3), v, iBlock) = btop_GB(g, :, :, v - br_ + 1, iBlock)
-            A(m+g, 1-ng:0, :, v, iBlock) = A(m, 1-ng:0, :, v, iBlock)              ! (edge ghosts: copied)
-            A(m+g, nb(2)+1:, :, v, iBlock) = A(m, nb(2)+1:, :, v, iBlock)
-            A(m+g, 1:nb(2), 1-ng:0, v, iBlock) = A(m, 1:nb(2), 1-ng:0, v, iBlock)
-            A(m+g, 1:nb(2), nb(3)+1:, v, iBlock) = A(m, 1:nb(2), nb(3)+1:, v, iBlock)
-          end do
+          call potential_ghosts(v)
           cycle
         end if
         if (v > s1_ .and. b_bc_top /= 'open' .and. b_bc_top /= 'potential') then
@@ -529,6 +530,21 @@ contains
         end do
       end do
     end subroutine box_top
+
+    ! the top ghosts of field component v from btop_GB (cz_top_potential);
+    ! the edge ghosts copied from the top cell's
+    subroutine potential_ghosts(v)
+      integer, intent(in) :: v
+      integer :: g, m
+      m = nb(1)
+      do g = 1, nGhost
+        A(m+g, 1:nb(2), 1:nb(3), v, iBlock) = btop_GB(g, :, :, v - br_ + 1, iBlock)
+        A(m+g, 1-ng:0, :, v, iBlock) = A(m, 1-ng:0, :, v, iBlock)
+        A(m+g, nb(2)+1:, :, v, iBlock) = A(m, nb(2)+1:, :, v, iBlock)
+        A(m+g, 1:nb(2), 1-ng:0, v, iBlock) = A(m, 1:nb(2), 1-ng:0, v, iBlock)
+        A(m+g, 1:nb(2), nb(3)+1:, v, iBlock) = A(m, 1:nb(2), nb(3)+1:, v, iBlock)
+      end do
+    end subroutine potential_ghosts
 
     subroutine relative_rho1(off)
       integer, intent(in) :: off
@@ -1140,7 +1156,7 @@ contains
     dt_now = dt
     ! the potential-field top: the top ghosts' B from this step's top layer
     ! (collective; the stages' fills use it)
-    if (use_B .and. wall_top == 'box' .and. b_bc_top == 'potential') then
+    if (use_B .and. b_bc_top == 'potential') then
       call tic(T_TOPB)
       call cz_top_potential()
       call toc(T_TOPB)
@@ -1163,6 +1179,14 @@ contains
       if (allocated(EtaB_GB) .and. .not. b_eta_explicit) call b_radial_implicit(iBlocks, dt)
       call toc(T_ADV)
       return
+    end if
+    ! Coriolis split: half a rotation first (also of StateOld, the RK stages' base)
+    if (omega_rot /= 0.0_dp .and. coriolis == 'split') then
+      do jb = 1, size(iBlocks)
+        call cz_bind(iBlocks(jb))
+        call coriolis_rotate(iBlocks(jb), 0.5_dp*dt, .true.)
+      end do
+      call cz_unbind()
     end if
     if (freeze_side /= 'none') then
       do jb = 1, size(iBlocks)
@@ -1497,6 +1521,14 @@ contains
       end if
     end do
     call cz_unbind()
+    ! ... and the second half after the step
+    if (omega_rot /= 0.0_dp .and. coriolis == 'split') then
+      do jb = 1, size(iBlocks)
+        call cz_bind(iBlocks(jb))
+        call coriolis_rotate(iBlocks(jb), 0.5_dp*dt, .false.)
+      end do
+      call cz_unbind()
+    end if
     ! ghost mode: the frozen side's blocks exactly as stored
     if (freeze_side /= 'none' .and. freeze_cz_mode == 'ghost') then
       do jb = 1, size(iBlocks)
@@ -1712,7 +1744,56 @@ contains
     end associate
     call toc(T_R_PRS)
     if (use_B) call rhs_mhd(ib)
+    if (omega_rot /= 0.0_dp .and. coriolis == 'rk') call rhs_coriolis(ib)
   end subroutine rhs
+
+  ! The f-plane's rotation axis in the state's slots (z, x, y): (sin lat, 0, cos lat)
+  pure function fplane_axis() result(n)
+    real(dp) :: n(3)
+    n = [sin(fplane_lat_deg*pi/180.0_dp), 0.0_dp, cos(fplane_lat_deg*pi/180.0_dp)]
+  end function fplane_axis
+
+  ! The exact solution of dv/dt = -2 Omega x v over tau (each shell's own
+  ! tau tsc(i)): v rotated about the f-plane's axis n by phi = -2 omega_rot
+  ! tau (Rodrigues): v' = v_par + cos(phi) v_perp + sin(phi) (n x v)
+  ! with_old: StateOld too (before the RK stages, which build on it)
+  subroutine coriolis_rotate(ib, tau, with_old)
+    integer, intent(in) :: ib
+    real(dp), intent(in) :: tau
+    logical, intent(in) :: with_old
+    integer :: i, j, k
+    real(dp) :: n(3), v(3), vpar(3), phi
+    n = fplane_axis()
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          phi = -2.0_dp*omega_rot*tau*tsc(i)
+          v = State_GVB(i, j, k, vr_:vp_, ib)
+          vpar = dot_product(n, v)*n
+          State_GVB(i, j, k, vr_:vp_, ib) = vpar + cos(phi)*(v - vpar) &
+              + sin(phi)*[n(2)*v(3) - n(3)*v(2), n(3)*v(1) - n(1)*v(3), n(1)*v(2) - n(2)*v(1)]
+          if (with_old) StateOld_GVB(i, j, k, vr_:vp_, ib) = State_GVB(i, j, k, vr_:vp_, ib)
+        end do
+      end do
+    end do
+  end subroutine coriolis_rotate
+
+  ! The Coriolis acceleration -2 Omega x v in the RK stages (coriolis = 'rk')
+  subroutine rhs_coriolis(ib)
+    integer, intent(in) :: ib
+    integer :: i, j, k
+    real(dp) :: om(3), v(3)
+    om = omega_rot*fplane_axis()
+    do k = 1, nb(3)
+      do j = 1, nb(2)
+        do i = 1, nb(1)
+          v = State_GVB(i, j, k, vr_:vp_, ib)
+          R_CV(i, j, k, vr_:vp_) = R_CV(i, j, k, vr_:vp_) &
+              - 2.0_dp*[om(2)*v(3) - om(3)*v(2), om(3)*v(1) - om(1)*v(3), om(1)*v(2) - om(2)*v(1)]
+        end do
+      end do
+    end do
+  end subroutine rhs_coriolis
 
   ! ================================================================ magnetic field
 

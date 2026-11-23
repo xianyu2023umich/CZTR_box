@@ -50,6 +50,9 @@ contains
     glm_cfl = glm_ch == 'cfl'
     grey_i0_g = 1                                 ! first cell of the implicit grey solve (whole column)
     if (grey_top_km > 0.0_dp) then
+      ! (a deep top, the cascade: no cell within grey_top_km of the photosphere;
+      ! explicit radiative diffusion in the whole column)
+      grey_i0_g = n_r + 1
       do i = 1, n_r
         if (-z_c(i) < grey_top_km*1.0e5_dp) then
           grey_i0_g = i
@@ -301,9 +304,19 @@ contains
 
   ! b_seed = 'potential': the field above the join (cells > k_join) replaced
   ! by the potential field of the join cell's B_z in the periodic box
-  ! (pf_coeffs, pf_eval: each mode decays as e^{-|k| dz} above the join cell's
-  ! centre; the mean b_0 continues as a uniform B_z). psi = 0 above the join.
+  ! (cz_extend_potential)
   module subroutine cz_seed_potential()
+    call cz_extend_potential(k_join)
+  end subroutine cz_seed_potential
+
+  ! The field above global cell ig0 (cells > ig0) replaced by the potential
+  ! field of cell ig0's B_z (pf_coeffs, pf_eval: each mode decays as
+  ! e^{-|k| dz} above the cell's centre; the mean b_0 continues as a uniform
+  ! B_z); psi = 0 there. The seed (ig0 = k_join) and the radial cascade (ig0
+  ! the export's top: the new layer's field is the potential extension the
+  ! potential top assumed, B_z continuous)
+  module subroutine cz_extend_potential(ig0)
+    integer, intent(in) :: ig0
     complex(dp), allocatable :: bk(:,:)
     real(dp), allocatable :: Bc(:,:,:)
     real(dp) :: z0, t0, bmax
@@ -312,16 +325,16 @@ contains
     t0 = arbor_wtime()
     call pf_init()
     allocate(bk(size(pf_ex, 1), size(pf_ey, 1)), Bc(nb(2), nb(3), 3))
-    call pf_coeffs(k_join, bk)
+    call pf_coeffs(ig0, bk)
     call cz_unbind()
-    z0 = z_c(k_join)
+    z0 = z_c(ig0)
     bmax = 0.0_dp
     do jb = 1, nBlock
       ib = iBlockList_I(jb)
-      if ((Key_IB(KI+1, ib) + 1)*nb(1) <= k_join) cycle
+      if ((Key_IB(KI+1, ib) + 1)*nb(1) <= ig0) cycle
       call cz_bind(ib)
       do i = 1, nb(1)
-        if (r_off + i <= k_join) cycle
+        if (r_off + i <= ig0) cycle
         call pf_eval(ib, bk, z_c(i) - z0, Bc)
         State_GVB(i, 1:nb(2), 1:nb(3), br_:bp_, ib) = Bc
         State_GVB(i, :, :, psi_, ib) = 0.0_dp
@@ -330,11 +343,11 @@ contains
     end do
     call cz_unbind()
     bmax = arbor_max(bmax)
-    write(msg, '(A,I0,A,I0,A,ES10.3,A,ES10.3,A,F8.2,A)') '  potential field above the join: ', size(bk, 1), ' x ', &
-        size(bk, 2), ' modes, mean B_z ', real(bk(1, 1)), ' G, max |B| above the join ', bmax, ' G; ', &
+    write(msg, '(A,I0,A,I0,A,I0,A,ES10.3,A,ES10.3,A,F8.2,A)') '  potential field above cell ', ig0, ': ', size(bk, 1), &
+        ' x ', size(bk, 2), ' modes, mean B_z ', real(bk(1, 1)), ' G, max |B| above ', bmax, ' G; ', &
         arbor_wtime() - t0, ' s'
     call arbor_print(msg)
-  end subroutine cz_seed_potential
+  end subroutine cz_extend_potential
 
   ! b_bc_top = 'potential': the top ghosts' B (btop_GB) from the potential
   ! field of the top cell layer's B_z (collective; once per step)
@@ -460,6 +473,9 @@ contains
     end do
     if (m == 0) call arbor_abort('cz3d: import: no state_export files in '//trim(import_dir))
     if (any(imp_nb(2:3) /= nb(2:3))) call arbor_abort('cz3d: import: the horizontal block size differs')
+    ! the export's top (cells): a taller run (the cascade) starts its blocks
+    ! above it from the init file (import_block)
+    imp_top = maxval(key_K(KI+1, 1:m) + 1)*imp_nb(1)
     if (mod(imp_nb(1), nb(1)) /= 0) call arbor_abort('cz3d: import: the radial block size must divide the exported one')
     call move_alloc(key_K, imp_key)
     call move_alloc(file_K, imp_file)
@@ -514,6 +530,8 @@ contains
     call import_open()
     m = import_record(Key_IB(:, iBlock), .true.)
     if (m == 0 .and. use_atmosphere .and. Key_IB(KI+1, iBlock)*nb(1) >= k_join) return
+    ! the cascade: a block above the export's top keeps the init file's state
+    if (m == 0 .and. Key_IB(KI+1, iBlock)*nb(1) >= imp_top) return
     if (m == 0) call arbor_abort('cz3d: import: no exported block at this place (a different grid?)')
     allocate(buf(imp_nb(1), imp_nb(2), imp_nb(3), imp_nv))
     write(name, '(A,A,I4.4,A)') trim(import_dir), '/state_export_r', imp_file(m), '.bin'

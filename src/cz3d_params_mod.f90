@@ -204,6 +204,17 @@ module cz3d_params_mod
   !     diffused like the velocity (without the density weight); with
   !     diffusion_heating the dissipated magnetic energy returns as heat ---
 
+  ! --- rotation (f-plane): the box at latitude fplane_lat_deg on a Sun
+  !     rotating with omega_rot [rad/s]: Omega = omega_rot (sin(lat) e_z +
+  !     cos(lat) e_y) (z up, y north), constant over the box; the Coriolis
+  !     acceleration -2 Omega x v (no centrifugal term). Solar: ~2.6e-6 (414
+  !     nHz); 0 = off ---
+  real(dp) :: omega_rot = 0.0_dp, fplane_lat_deg = 30.0_dp
+  ! how: 'split' (exact rotation of v about Omega by -2 Omega dt/2 before and
+  ! after each step, Strang; no stability limit, |v| kept exactly) or 'rk'
+  ! (the term in the RK stages; unstable for 2 Omega dt > ~2.8)
+  character(len=8) :: coriolis = 'split'
+
   logical  :: use_B = .false.
   real(dp) :: alpha_glm = 0.5_dp
   ! the GLM cleaning speed c_h: 'fast' (c_s0/xi + v_A, as solar_model) or
@@ -390,7 +401,8 @@ module cz3d_params_mod
   ! times the top cell's (mass can cross, vertical flows damped); v_x, v_y
   ! and s1 copied, the density relative to the background copied (rho/rho0):
   ! the ghosts follow the background's hydrostatic stratification; B:
-  ! b_bc_top ('potential' (MURaM): the ghosts' B the potential field of the
+  ! b_bc_top ('potential' (MURaM; also with the walls 'face' and 'cell', the
+  ! radial cascade's deep tops): the ghosts' B the potential field of the
   ! top cell layer's B_z, B = Re sum_k b_k e^(i k.x) e^(-|k| dz), B_h from
   ! -i k_h/|k| (the mean B_z kept), recomputed once per step (a DFT of the
   ! top layer, collective; every block at the level refine_h); 'open': every
@@ -572,7 +584,7 @@ module cz3d_params_mod
       b_bc_top, b_seed, b_seed_G, export_state, import_dir, plot_blocks, box_lx_mm, box_ly_mm, n_x, n_y, &
       nb_x, nb_y, patch_x_mm, patch_y_mm, patch_radius_mm, probe_x_mm, probe_y_mm, probe_radius_mm, &
       region_x_mm, region_y_mm, region_radius_mm, region_z_km, region_every, b_seed_z1_km, b_seed_z2_km, &
-      box_top_vz, b_seed_test
+      box_top_vz, b_seed_test, omega_rot, fplane_lat_deg, coriolis
 
 contains
 
@@ -597,8 +609,8 @@ contains
     if (b_bc_bottom /= 'conductor' .and. b_bc_bottom /= 'radial') call arbor_abort('b_bc_bottom must be conductor or radial')
     if (b_bc_top /= 'conductor' .and. b_bc_top /= 'radial' .and. b_bc_top /= 'open' .and. b_bc_top /= 'potential') &
         call arbor_abort('b_bc_top must be conductor, radial, open or potential')
-    if ((b_bc_top == 'open' .or. b_bc_top == 'potential') .and. wall_top /= 'box') &
-        call arbor_abort("b_bc_top = 'open' or 'potential' needs wall_top = 'box'")
+    if (b_bc_top == 'open' .and. wall_top /= 'box') call arbor_abort("b_bc_top = 'open' needs wall_top = 'box'")
+    if (coriolis /= 'split' .and. coriolis /= 'rk') call arbor_abort('coriolis must be split or rk')
     if (b_bc_top == 'potential' .and. mr_levels > 1) call arbor_abort("b_bc_top = 'potential' needs global steps (mr_levels <= 1)")
     if (wall_time_max > 0.0_dp .and. wall_time_margin >= wall_time_max) call arbor_abort('wall_time_margin must be below wall_time_max')
     if (wall_check_steps < 1) call arbor_abort('wall_check_steps must be >= 1')
@@ -633,6 +645,8 @@ contains
     if (freeze_float_cells < 0) call arbor_abort('freeze_float_cells must be >= 0')
     if (ghost_limiter /= 'minmod' .and. ghost_limiter /= 'mc' .and. ghost_limiter /= 'none') &
         call arbor_abort('ghost_limiter must be minmod, mc or none')
+    if (b_seed == 'uniform' .and. (b_bc_bottom == 'conductor' .or. b_bc_top == 'conductor')) &
+        call arbor_abort("b_seed = 'uniform' (B_z) needs no conductor wall (B_z odd there: a jump, div B)")
     if (b_seed == 'potential' .and. .not. (use_B .and. use_atmosphere)) &
         call arbor_abort('b_seed = potential needs use_B and use_atmosphere (the field above the join)')
     if (top_energy /= 'eddington' .and. top_energy /= 'cooling') call arbor_abort('top_energy must be eddington or cooling')

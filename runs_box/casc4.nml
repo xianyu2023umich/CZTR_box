@@ -1,0 +1,29 @@
+! Radial cascade, level 4: the CZ to the photosphere (196 cells), Eddington
+! top, MLT with its switch, RSST anchored 500 km deep (as CZTR_3D's CZ
+! runs); dt ~2.1 s (the photosphere cell's CFL; laptop 2026-11-22). From
+! level 3's export (cells 169..196 from the init file); export at the end
+! for the full run with the atmosphere (runs_box/smoke_atm.nml style, import_dir).
+!   mpirun -np 8 ./cztr_box.x runs_box/casc4.nml
+! MHD: the field from the level below (import); mhd5's va_max 10 km/s.
+! The top field condition: the potential field (the next level's new layer
+! starts with its extension: B continuous); f-plane rotation at 30 deg,
+! the solar rate (414 nHz).
+&cz3d
+  grid_file = 'data/grid_atm20.dat', init_file = 'data/init_wind20_dip_m600.dat', n_r_cells = 0
+  table_file = 'data/eos_table_wind.bin'
+  box_lx_mm = 696.0, box_ly_mm = 696.0, n_x = 128, n_y = 128, nb_x = 16, nb_y = 16, nb_r = 28
+  diffusion_heating = .true.
+  out_dir = 'output/casc4'
+  import_dir = 'output/casc3'
+  wall_top = 'cell'
+  top_energy = 'eddington', grey_tau_above = 0.01, grey_top_km = 1000.0
+  use_convection = .true., mlt_switch = .true., mlt_R0 = 1.0, mlt_p = 4.0
+  rsst_depth_km = 500.0, rsst_q = 0.0, rsst_form = 'hotta2012'
+  diff_top_km = 500.0
+  use_B = .true., b_bc_bottom = 'conductor', b_bc_top = 'potential', glm_ch = 'cfl', va_max = 1.0e6
+  b_seed = 'none'
+  omega_rot = 2.6e-6, fplane_lat_deg = 30.0
+  t_end = 1.0e9, n_step_max = 1000, dt_max = 1.0e4
+  n_log = 100, prof_every = 500, restart_dt = 3600.0
+  export_state = .true.
+/

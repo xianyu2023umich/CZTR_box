@@ -255,6 +255,41 @@ smoke_hd; laptop timings vary +-10% run to run):
 - 32^2 blocks: the fills, the potential top and the atmosphere ~10% cheaper,
   the step about the same as 16^2 within the noise.
 
+Radial cascade (2026-11-22; the plan of CZ_3D/notes/radial_cascade.md):
+CZ-only runs with the top at a radial-block face (n_r_cells 112, 140, 168,
+196 = 0.954, 0.991, 0.998, 1.0 R), each exported and imported into the next;
+the blocks above the export's top start from the init file (imp_top). Deep
+tops: face wall, cooling layer (cool_width_hp 1, F_sun per box area), MLT
+off; one RSST through the cascade (the user, 2026-11-22): anchored 500 km
+deep (rsst_depth_km, the anchor's c_s ~9 km/s from the whole profile's CZ,
+z_cz/cs_cz in cz3d_bg_mod, so also above a deep top), xi 25 at the base;
+with no cell within grey_top_km the radiation is the explicit diffusion
+everywhere. runs_box/casc1..4.nml. Chain 1 -> 2 -> 3 -> 4 tested by export
+and import (20 steps each, 128^2, laptop, 8 ranks, ~0.40 us per cell-step per
+rank): dt 48.7, 16.0, 4.9, 2.1 s (each the top cell's CFL with c ~9 km/s;
+level 1 at the base cell); wall 0.09, 0.115, 0.135, 0.17 s per step. With the
+plan's lengths (1 yr, 2 weeks, 3 days, 2 days) ~16 + 2.4 + 2 + 4 h on the
+laptop at 128^2. (A fixed c_target 2 km/s gave 220, 72, 22 s for levels 1-3
+but cannot be used at the photosphere.) Small flux transients where a new
+layer meets the old top. Open: starting a new layer from a relaxed run's
+export instead of the 1D init profile; the old top's cooled layer adjusts
+after each insertion.
+
+Potential top at deep walls and f-plane rotation (2026-11-22):
+- b_bc_top = 'potential' with any top wall (the deep face walls of the
+  cascade too). A cascade import with the field fills the new layer with the
+  potential extension of the export's top B_z (cz_extend_potential), the
+  field the potential top assumed: B continuous at the old top (tested:
+  rms(div B dx)/rms|B| ~1e-9 before and after the insertion). (Chosen over a
+  conductor top, which traps horizontal flux under the wall and blocks the
+  magnetic helicity flux, and over the radial top, which forces B_h = 0.)
+- f-plane: omega_rot, fplane_lat_deg (default 30), coriolis 'split'/'rk';
+  Omega = omega_rot (sin(lat) e_z + cos(lat) e_y) constant over the box (y
+  north; the full Coriolis term, horizontal component included). An eastward
+  flow is deflected south (to its right) and upward. Without rotation the box
+  has only a small-scale dynamo; with it a large-scale one is possible.
+- runs_box/casc1..4: the potential top, the f-plane at 30 deg, 414 nHz.
+
 Next: a hydro CZ run to a convective steady state
 (the deep CZ's thermal adjustment to the box flux), then the atmosphere and
 field; a vertical-view synthetic image.
