@@ -2,7 +2,9 @@
 ! restart_from to its last restart file, restart_YYYYYYYY.rst at day 100).
 ! The field from 0 plus the zero-net-flux seed B_x = 100 G sin(2 pi y/Ly)
 ! below -55 Mm, none above -35 Mm (b_seed_ny = 1: the field's growth or
-! decay is the dynamo's), the potential top, the f-plane at 30 deg (414 nHz),
+! decay is the dynamo's), the conductor top (2026-11-24, the user: as the
+! CZTR_3D cascade; B_r = 0 at the top, so the next level's layer can start
+! field free; was the potential top), the f-plane at 30 deg (414 nHz),
 ! va_max 10 km/s. Up to a model year (t_end day 465; stop and continue from
 ! the restarts at will: restart_from + restart_new_output = .false.).
 ! Profiles daily, restarts every 20 days (~0.5 GB each), layer dumps of
@@ -24,7 +26,7 @@
   use_convection = .false.
   top_energy = 'cooling', cool_width_hp = 1.0, grey_top_km = 1000.0
   rsst_depth_km = 500.0, rsst_q = -0.5, rsst_form = 'hotta2012'
-  use_B = .true., b_bc_bottom = 'conductor', b_bc_top = 'potential', glm_ch = 'cfl', va_max = 1.0e6
+  use_B = .true., b_bc_bottom = 'conductor', b_bc_top = 'conductor', glm_ch = 'cfl', va_max = 1.0e6
   b_seed = 'horizontal', b_seed_G = 100.0, b_seed_z1_km = -55000.0, b_seed_z2_km = -35000.0, b_seed_ny = 1
   omega_rot = 2.6e-6, fplane_lat_deg = 30.0
   t_end = 40176000.0, n_step_max = 10000000, dt_max = 1.0e4
